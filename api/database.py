@@ -5,7 +5,7 @@ import psycopg
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://controlplane:controlplane@localhost:5432/controlplane",
+    "postgresql://controlplane:controlplane@localhost:5433/controlplane",
 )
 
 
