@@ -14,6 +14,7 @@ services:
 
     volumes:
       - controlplane_postgres_data:/var/lib/postgresql/data
+      - ./tables/traces.sql:/docker-entrypoint-initdb.d/traces.sql:ro
 
 volumes:
   controlplane_postgres_data:
