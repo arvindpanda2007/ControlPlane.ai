@@ -16,7 +16,11 @@ CREATE TABLE IF NOT EXISTS traces (
 
     session_id VARCHAR(255),
 
-    status VARCHAR(50) NOT NULL DEFAULT 'success'
+    status VARCHAR(50) NOT NULL DEFAULT 'success',
+
+    safety_flag BOOLEAN NOT NULL DEFAULT FALSE,
+    safety_type VARCHAR(100),
+    safety_action VARCHAR(50)
 );
 
 CREATE INDEX IF NOT EXISTS idx_traces_created_at

@@ -1,4 +1,5 @@
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 
 
 class ControlPlane:
@@ -7,6 +8,7 @@ class ControlPlane:
         api_url: str = "http://127.0.0.1:8000",
     ):
         self.api_url = api_url.rstrip("/")
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def trace(
         self,
@@ -20,6 +22,9 @@ class ControlPlane:
         latency_ms: int | None = None,
         session_id: str | None = None,
         status: str = "success",
+        safety_flag: bool = False,
+        safety_type: str | None = None,
+        safety_action: str | None = None,
     ):
         payload = {
             "provider": provider,
@@ -31,14 +36,22 @@ class ControlPlane:
             "latency_ms": latency_ms,
             "session_id": session_id,
             "status": status,
+            "safety_flag": safety_flag,
+            "safety_type": safety_type,
+            "safety_action": safety_action,
         }
 
-        response = httpx.post(
-            f"{self.api_url}/traces",
-            json=payload,
-            timeout=5.0,
-        )
+        self._executor.submit(self._send_trace, payload)
 
-        response.raise_for_status()
+    def _send_trace(self, payload: dict):
+        try:
+            response = httpx.post(
+                f"{self.api_url}/traces",
+                json=payload,
+                timeout=5.0,
+            )
 
-        return response.json()
+            response.raise_for_status()
+
+        except Exception as error:
+            print(f"ControlPlane trace failed: {error}")

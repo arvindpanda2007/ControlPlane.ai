@@ -19,6 +19,9 @@ class TraceCreate(BaseModel):
     latency_ms: int | None = None
     session_id: str | None = None
     status: str = "success"
+    safety_flag: bool = False
+    safety_type: str | None = None
+    safety_action: str | None = None
 
 
 @app.get("/health")
@@ -44,9 +47,12 @@ def create_trace(trace: TraceCreate):
                     output_tokens,
                     latency_ms,
                     session_id,
-                    status
+                    status,
+                    safety_flag,
+                    safety_type,
+                    safety_action
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     trace_id,
@@ -59,6 +65,9 @@ def create_trace(trace: TraceCreate):
                     trace.latency_ms,
                     trace.session_id,
                     trace.status,
+                    trace.safety_flag,
+                    trace.safety_type,
+                    trace.safety_action
                 ),
             )
 
