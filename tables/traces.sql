@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS traces (
     output_tokens INTEGER,
 
     latency_ms INTEGER,
+    estimated_cost_usd DOUBLE PRECISION,
 
     session_id VARCHAR(255),
 
@@ -28,3 +29,34 @@ CREATE INDEX IF NOT EXISTS idx_traces_created_at
 
 CREATE INDEX IF NOT EXISTS idx_traces_session_id
     ON traces (session_id);
+
+CREATE TABLE IF NOT EXISTS spans (
+    id UUID PRIMARY KEY,
+
+    trace_id UUID NOT NULL,
+
+    parent_span_id UUID,
+
+    name VARCHAR(255) NOT NULL,
+
+    span_type VARCHAR(50) NOT NULL,
+
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    ended_at TIMESTAMPTZ,
+
+    duration_ms INTEGER,
+
+    status VARCHAR(50) NOT NULL DEFAULT 'success',
+
+    metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_spans_trace_id
+    ON spans (trace_id);
+
+CREATE INDEX IF NOT EXISTS idx_spans_parent_span_id
+    ON spans (parent_span_id);
+
+CREATE INDEX IF NOT EXISTS idx_spans_started_at
+    ON spans (started_at DESC);

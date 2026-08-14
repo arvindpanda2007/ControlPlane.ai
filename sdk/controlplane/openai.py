@@ -2,6 +2,7 @@ import time
 
 from openai import OpenAI
 
+from .cost import calculate_cost
 from .client import ControlPlane
 from .injection import InjectionViolation, check_input
 from .safety import SafetyViolation, check_output
@@ -21,13 +22,11 @@ class OpenAIClient:
         *,
         model: str,
         messages: list[dict],
+        context: str | None = None,
         session_id: str | None = None,
+        trace=None,
     ):
         start_time = time.perf_counter()
-
-        # ---------------------------------------------------------
-        # 1. Extract input
-        # ---------------------------------------------------------
 
         input_text = "\n".join(
             message["content"]
@@ -36,7 +35,7 @@ class OpenAIClient:
         )
 
         # ---------------------------------------------------------
-        # 2. INLINE PROMPT-INJECTION CHECK
+        # 1. INPUT / PROMPT INJECTION CHECK
         # ---------------------------------------------------------
 
         try:
@@ -52,6 +51,8 @@ class OpenAIClient:
                 model=model,
                 input=input_text,
                 latency_ms=latency_ms,
+                estimated_cost_usd=None,
+                context=context,
                 session_id=session_id,
                 status="blocked",
                 safety_flag=True,
@@ -59,36 +60,46 @@ class OpenAIClient:
                 safety_action="block",
             )
 
-            # IMPORTANT:
-            # OpenAI has NOT been called.
             raise
 
         # ---------------------------------------------------------
-        # 3. CALL OPENAI
+        # 2. CREATE LLM SPAN
         # ---------------------------------------------------------
 
+        llm_span = None
+
+        if trace:
+            llm_span = trace.span(
+                "openai",
+                span_type="llm",
+            )
+
+            llm_span.__enter__()
+
         try:
+            # -----------------------------------------------------
+            # 3. CALL OPENAI
+            # -----------------------------------------------------
+
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages,
             )
-
-            # -----------------------------------------------------
-            # 4. Measure model latency
-            # -----------------------------------------------------
 
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
 
             # -----------------------------------------------------
-            # 5. Extract output
+            # 4. EXTRACT OUTPUT
             # -----------------------------------------------------
 
-            output_text = response.choices[0].message.content or ""
+            output_text = (
+                response.choices[0].message.content or ""
+            )
 
             # -----------------------------------------------------
-            # 6. Extract token usage
+            # 5. EXTRACT TOKEN USAGE
             # -----------------------------------------------------
 
             input_tokens = None
@@ -99,13 +110,57 @@ class OpenAIClient:
                 output_tokens = response.usage.completion_tokens
 
             # -----------------------------------------------------
-            # 7. INLINE OUTPUT SAFETY CHECK
+            # 6. CALCULATE COST
+            # -----------------------------------------------------
+
+            estimated_cost_usd = calculate_cost(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+
+            # -----------------------------------------------------
+            # 7. UPDATE LLM SPAN METADATA
+            # -----------------------------------------------------
+
+            if llm_span:
+                llm_span.metadata.update(
+                    {
+                        "model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "estimated_cost_usd": estimated_cost_usd,
+                    }
+                )
+
+            # -----------------------------------------------------
+            # 8. OUTPUT SAFETY CHECK
             # -----------------------------------------------------
 
             try:
                 check_output(output_text)
 
             except SafetyViolation as error:
+
+                if llm_span:
+                    llm_span.metadata.update(
+                        {
+                            "safety_flag": True,
+                            "safety_type": ",".join(
+                                error.violations
+                            ),
+                            "safety_action": "block",
+                        }
+                    )
+
+                    llm_span.__exit__(
+                        SafetyViolation,
+                        error,
+                        error.__traceback__,
+                    )
+
+                    llm_span = None
+
                 self.controlplane.trace(
                     provider="openai",
                     model=model,
@@ -114,6 +169,8 @@ class OpenAIClient:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     latency_ms=latency_ms,
+                    estimated_cost_usd=estimated_cost_usd,
+                    context=context,
                     session_id=session_id,
                     status="blocked",
                     safety_flag=True,
@@ -121,12 +178,28 @@ class OpenAIClient:
                     safety_action="block",
                 )
 
-                # Do NOT return unsafe output
                 raise
 
             # -----------------------------------------------------
-            # 8. SAFE RESPONSE → RECORD TRACE
+            # 9. SAFE RESPONSE
             # -----------------------------------------------------
+
+            if llm_span:
+                llm_span.metadata.update(
+                    {
+                        "safety_flag": False,
+                        "safety_type": None,
+                        "safety_action": None,
+                    }
+                )
+
+                llm_span.__exit__(
+                    None,
+                    None,
+                    None,
+                )
+
+                llm_span = None
 
             self.controlplane.trace(
                 provider="openai",
@@ -136,6 +209,8 @@ class OpenAIClient:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
+                estimated_cost_usd=estimated_cost_usd,
+                context=context,
                 session_id=session_id,
                 status="success",
                 safety_flag=False,
@@ -143,25 +218,40 @@ class OpenAIClient:
                 safety_action=None,
             )
 
-            # -----------------------------------------------------
-            # 9. Return response
-            # -----------------------------------------------------
-
             return response
 
         except SafetyViolation:
             raise
 
-        except Exception:
+        except Exception as error:
+
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+
+            if llm_span:
+                llm_span.metadata.update(
+                    {
+                        "error": True,
+                        "error_type": type(error).__name__,
+                    }
+                )
+
+                llm_span.__exit__(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                )
+
+                llm_span = None
 
             self.controlplane.trace(
                 provider="openai",
                 model=model,
                 input=input_text,
                 latency_ms=latency_ms,
+                estimated_cost_usd=None,
+                context=context,
                 session_id=session_id,
                 status="error",
                 safety_flag=False,
