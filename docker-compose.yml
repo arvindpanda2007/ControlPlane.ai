@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: controlplane-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: controlplane
+      POSTGRES_PASSWORD: controlplane
+      POSTGRES_DB: controlplane
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - controlplane_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  controlplane_postgres_data:

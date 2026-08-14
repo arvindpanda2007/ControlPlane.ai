@@ -1,0 +1,91 @@
+# PRD: ControlPlane Checker
+
+**Status:** Draft v1
+**Owner:** Arvi
+**Last updated:** August 2026
+
+---
+
+## 1. Problem Statement
+
+Teams shipping LLM applications have no reliable way to know, in production, whether a given response was **correct**, **efficient**, and **safe** — until a user has already acted on it or complained. Existing tools either:
+
+- Provide tracing/logging only (LangSmith, Helicone) with no automated judgment on response quality, or
+- Provide offline eval suites that run against a fixed test set, not live traffic, or
+- Provide safety/moderation layers that only check inputs, not the reasoning or factual grounding of outputs.
+
+There is no lightweight layer that sits between an app and its users, watches every real response, and tells the team — fast enough to matter — that something is confidently wrong, quietly expensive, or unsafe.
+
+## 2. Goal
+
+Build a drop-in observability + evaluation layer for LLM applications that scores every production response along three axes — **Performance (correctness)**, **Cost/Efficiency**, and **Responsibility (safety/bias/leakage)** — without materially increasing user-facing latency.
+
+## 3. Non-Goals (v1)
+
+- Not a full RAG or retrieval system — ControlPlane consumes an app's existing context, it doesn't build one.
+- Not a general-purpose content moderation API (Perspective API, OpenAI moderation) — those are inputs we may call, not something we're rebuilding.
+- Not a training/fine-tuning feedback loop in v1 — flagged data is exported, not auto-used for retraining.
+- Not guaranteed real-time blocking for every failure mode — see Section 5, this is the central design constraint of the whole product.
+
+## 4. Core Design Constraint
+
+You cannot have all three of: (a) evaluate every response, (b) do it live, (c) add zero latency to the user-facing call. Something must give. ControlPlane resolves this by splitting evaluation into two lanes:
+
+| Lane | Runs | Budget | Can block response? | Handles |
+|---|---|---|---|---|
+| **Inline** | Before response returns to user | <150ms p95 | Yes | Prompt injection screening, PII/secret leakage regex, cost/token metering |
+| **Shadow (async)** | After response is sent, on a copied trace | Seconds to low minutes | No — flags/alerts only | Factuality scoring, hallucination detection, bias/quality LLM-as-judge, drift detection |
+
+This means "real-time" in the product's marketing has to be scoped honestly as "real-time visibility," not "real-time correction," for anything beyond cheap pattern-based checks. This distinction should be explicit in the product surface, not hidden — teams need to know which checks can stop a bad response and which only flag it after the fact.
+
+## 5. User & Use Case
+
+**Primary user:** An engineer or PM at a small-to-mid team shipping an LLM feature (chatbot, agent, copilot) who has no dedicated eval/observability headcount.
+
+**Primary use case:** Drop a lightweight SDK/proxy into an existing app. Get a dashboard showing response-level scores, trend lines on hallucination rate / cost per query / safety flags, and alerts when something crosses a threshold.
+
+## 6. Scope for MVP
+
+### 6.1 Tracing (table stakes)
+- Capture every request/response pair: prompt, completion, model, token counts, latency, timestamp, user/session ID.
+- Store in a queryable store (Postgres to start); expose a simple trace viewer.
+
+### 6.2 Inline checks (blocking, <150ms budget)
+- **Prompt injection screening** — small classifier or rule-based heuristic run on the *input* before it reaches the model. Not an LLM call.
+- **PII/secret leakage regex** — scan the *output* for patterns (API keys, emails, SSNs) before returning to user.
+- **Cost/latency metering** — pure metadata capture, no added latency; this is bookkeeping, not evaluation.
+
+### 6.3 Shadow checks (async, non-blocking)
+- **Factuality scoring** — if the app is RAG-based, check completion claims against the retrieved chunks it was given (cheap, grounded). Open-domain factchecking against the live web is explicitly out of scope for v1 — too slow and too unreliable to be a trustworthy signal.
+- **Hallucination / confidence scoring** — LLM-as-judge pass scoring whether the response is well-supported by its own stated context.
+- **Bias/quality flags** — lightweight rubric-based judge call, sampled (not 100% of traffic) to control cost.
+
+### 6.4 Dashboard & Alerting
+- Response-level detail view: score breakdown per response.
+- Aggregate view: trend lines for hallucination rate, safety flag rate, p95 latency, cost per 1K requests.
+- Threshold-based alerting (Slack/webhook) when a metric crosses a set bound.
+
+## 7. Explicitly Deferred (v2+)
+
+- Open-domain factchecking (web-grounded)
+- Auto-remediation (e.g., auto-retry or auto-rewrite on flagged response)
+- Fine-tuning feedback loop from flagged data
+- Multi-model comparison / A-B eval dashboards
+- Custom rubric builder UI (v1 ships with fixed rubrics)
+
+## 8. Success Metrics
+
+- **Adoption:** Time from SDK install to first dashboard signal < 10 minutes.
+- **Inline overhead:** p95 added latency from inline checks < 150ms.
+- **Signal quality:** Shadow-lane factuality/hallucination scores agree with human-labeled spot checks ≥ 80% of the time on a held-out sample.
+- **Alert usefulness:** False positive rate on safety/injection flags low enough that teams don't disable alerting within first week of use (proxy metric: alert-disable rate).
+
+## 9. Open Questions
+
+1. For non-RAG apps (no retrieved context to check claims against), what does factuality scoring even mean? Possibly out of scope for those apps in v1 — worth stating plainly rather than faking a score.
+2. Sampling rate for shadow-lane LLM-as-judge calls — 100% of traffic will not be cost-viable at any real volume. What sampling strategy (uniform vs. risk-weighted, e.g., sample more on longer or lower-confidence responses) keeps cost bounded while still catching rare failures?
+3. Where does the injection classifier's training data come from for v1 — off-the-shelf model, or a small labeled set built in-house?
+
+## 10. Why This Ordering
+
+Tracing first because it's the substrate everything else is built on and is the fastest path to something a user can see working. Inline checks second because they're cheap and demonstrate the "blocking" value prop concretely. Shadow checks last in build order (even though they're the more interesting eval work) because they depend on the tracing pipeline existing and because getting the sampling/cost math wrong here is the most likely way the whole product becomes unviable to run.
