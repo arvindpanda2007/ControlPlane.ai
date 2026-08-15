@@ -668,195 +668,308 @@ def get_spans(trace_id: str):
 @app.get("/analytics/overview")
 def get_analytics_overview():
     """
-    Dashboard-level production metrics.
+    Dashboard overview.
 
-    Workflow traces are provider='controlplane',
-    model='workflow'.
-
-    LLM child traces are excluded from workflow reliability
-    numbers to avoid double-counting.
+    Workflow metrics describe the application/workflow itself.
+    LLM metrics describe child model requests separately so
+    workflow records are not double-counted.
+    Shadow metrics describe factuality evaluations when present.
     """
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
-
             cursor.execute(
                 """
                 SELECT
                     COUNT(*),
-
-                    COUNT(*) FILTER (
-                        WHERE status = 'success'
-                    ),
-
-                    COUNT(*) FILTER (
-                        WHERE status = 'error'
-                    ),
-
-                    COUNT(*) FILTER (
-                        WHERE status = 'blocked'
-                    ),
-
-                    COUNT(*) FILTER (
-                        WHERE status = 'running'
-                    ),
-
-                    COUNT(*) FILTER (
-                        WHERE status = 'pending'
-                    ),
-
+                    COUNT(*) FILTER (WHERE status = 'success'),
+                    COUNT(*) FILTER (WHERE status = 'error'),
+                    COUNT(*) FILTER (WHERE status = 'blocked'),
+                    COUNT(*) FILTER (WHERE status = 'running'),
+                    COUNT(*) FILTER (WHERE status = 'pending'),
                     COALESCE(
                         AVG(latency_ms)
-                        FILTER (
-                            WHERE latency_ms IS NOT NULL
-                        ),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(estimated_cost_usd),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(input_tokens),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(output_tokens),
-                        0
+                        FILTER (WHERE latency_ms IS NOT NULL), 0
                     )
-
                 FROM traces
                 WHERE provider = 'controlplane'
                   AND model = 'workflow'
                 """
             )
-
-            overall = cursor.fetchone()
+            workflow = cursor.fetchone()
 
             cursor.execute(
                 """
                 SELECT
                     percentile_cont(0.50)
-                    WITHIN GROUP (
-                        ORDER BY latency_ms
-                    ),
-
+                    WITHIN GROUP (ORDER BY latency_ms),
                     percentile_cont(0.95)
-                    WITHIN GROUP (
-                        ORDER BY latency_ms
-                    ),
-
+                    WITHIN GROUP (ORDER BY latency_ms),
                     percentile_cont(0.99)
-                    WITHIN GROUP (
-                        ORDER BY latency_ms
-                    )
-
+                    WITHIN GROUP (ORDER BY latency_ms)
                 FROM traces
                 WHERE provider = 'controlplane'
                   AND model = 'workflow'
                   AND latency_ms IS NOT NULL
                 """
             )
+            workflow_percentiles = cursor.fetchone()
 
-            percentiles = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE status = 'success'),
+                    COUNT(*) FILTER (WHERE status = 'error'),
+                    COUNT(*) FILTER (WHERE status = 'blocked'),
+                    COUNT(*) FILTER (WHERE status = 'running'),
+                    COUNT(*) FILTER (WHERE status = 'pending'),
+                    COALESCE(
+                        AVG(latency_ms)
+                        FILTER (WHERE latency_ms IS NOT NULL), 0
+                    ),
+                    COALESCE(SUM(estimated_cost_usd), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0)
+                FROM traces
+                WHERE NOT (
+                    provider = 'controlplane'
+                    AND model = 'workflow'
+                )
+                """
+            )
+            llm = cursor.fetchone()
 
-    total = overall[0] or 0
-    successful = overall[1] or 0
-    errors = overall[2] or 0
-    blocked = overall[3] or 0
-    running = overall[4] or 0
-    pending = overall[5] or 0
+            cursor.execute(
+                """
+                SELECT
+                    percentile_cont(0.50)
+                    WITHIN GROUP (ORDER BY latency_ms),
+                    percentile_cont(0.95)
+                    WITHIN GROUP (ORDER BY latency_ms),
+                    percentile_cont(0.99)
+                    WITHIN GROUP (ORDER BY latency_ms)
+                FROM traces
+                WHERE NOT (
+                    provider = 'controlplane'
+                    AND model = 'workflow'
+                )
+                AND latency_ms IS NOT NULL
+                """
+            )
+            llm_percentiles = cursor.fetchone()
 
-    completed = (
-        successful
-        + errors
-        + blocked
+            cursor.execute(
+                """
+                SELECT
+                    provider,
+                    model,
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE status = 'success'),
+                    COUNT(*) FILTER (WHERE status = 'error'),
+                    COUNT(*) FILTER (WHERE status = 'blocked'),
+                    COALESCE(
+                        AVG(latency_ms)
+                        FILTER (WHERE latency_ms IS NOT NULL), 0
+                    ),
+                    COALESCE(SUM(estimated_cost_usd), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0)
+                FROM traces
+                WHERE NOT (
+                    provider = 'controlplane'
+                    AND model = 'workflow'
+                )
+                GROUP BY provider, model
+                ORDER BY COUNT(*) DESC
+                """
+            )
+            model_rows = cursor.fetchall()
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE factuality_status IS NOT NULL
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE factuality_status = 'supported'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE factuality_status = 'partially_supported'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE factuality_status = 'unsupported'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE factuality_status IS NULL
+                    ),
+                    AVG(factuality_score)
+                    FILTER (WHERE factuality_score IS NOT NULL)
+                FROM traces
+                """
+            )
+            shadow = cursor.fetchone()
+
+    workflow_total = workflow[0] or 0
+    workflow_success = workflow[1] or 0
+    workflow_errors = workflow[2] or 0
+    workflow_blocked = workflow[3] or 0
+    workflow_running = workflow[4] or 0
+    workflow_pending = workflow[5] or 0
+
+    workflow_completed = (
+        workflow_success + workflow_errors + workflow_blocked
     )
 
-    success_rate = (
-        successful / completed * 100
-        if completed
-        else 0
+    workflow_success_rate = (
+        workflow_success / workflow_completed * 100
+        if workflow_completed else 0
+    )
+    workflow_error_rate = (
+        workflow_errors / workflow_completed * 100
+        if workflow_completed else 0
+    )
+    workflow_blocked_rate = (
+        workflow_blocked / workflow_completed * 100
+        if workflow_completed else 0
     )
 
-    error_rate = (
-        errors / completed * 100
-        if completed
-        else 0
+    llm_total = llm[0] or 0
+    llm_success = llm[1] or 0
+    llm_errors = llm[2] or 0
+    llm_blocked = llm[3] or 0
+    llm_running = llm[4] or 0
+    llm_pending = llm[5] or 0
+
+    llm_completed = llm_success + llm_errors + llm_blocked
+
+    llm_success_rate = (
+        llm_success / llm_completed * 100
+        if llm_completed else 0
+    )
+    llm_error_rate = (
+        llm_errors / llm_completed * 100
+        if llm_completed else 0
+    )
+    llm_blocked_rate = (
+        llm_blocked / llm_completed * 100
+        if llm_completed else 0
     )
 
-    blocked_rate = (
-        blocked / completed * 100
-        if completed
-        else 0
+    shadow_evaluated = shadow[0] or 0
+    shadow_supported = shadow[1] or 0
+    shadow_partial = shadow[2] or 0
+    shadow_unsupported = shadow[3] or 0
+    shadow_pending = shadow[4] or 0
+    shadow_scored = (
+        shadow_supported + shadow_partial + shadow_unsupported
     )
 
     return {
-        "runs": total,
-
-        "reliability": {
-            "successful": successful,
-            "errors": errors,
-            "blocked": blocked,
-            "running": running,
-            "pending": pending,
-
-            "success_rate": round(
-                success_rate,
-                2,
-            ),
-
-            "error_rate": round(
-                error_rate,
-                2,
-            ),
-
-            "blocked_rate": round(
-                blocked_rate,
-                2,
-            ),
+        "workflow": {
+            "runs": workflow_total,
+            "reliability": {
+                "successful": workflow_success,
+                "errors": workflow_errors,
+                "blocked": workflow_blocked,
+                "running": workflow_running,
+                "pending": workflow_pending,
+                "success_rate": round(workflow_success_rate, 2),
+                "error_rate": round(workflow_error_rate, 2),
+                "blocked_rate": round(workflow_blocked_rate, 2),
+            },
+            "performance": {
+                "average_latency_ms": float(workflow[6] or 0),
+                "p50_latency_ms": (
+                    float(workflow_percentiles[0])
+                    if workflow_percentiles[0] is not None else None
+                ),
+                "p95_latency_ms": (
+                    float(workflow_percentiles[1])
+                    if workflow_percentiles[1] is not None else None
+                ),
+                "p99_latency_ms": (
+                    float(workflow_percentiles[2])
+                    if workflow_percentiles[2] is not None else None
+                ),
+            },
         },
-
-        "performance": {
-            "average_latency_ms": float(
-                overall[6] or 0
-            ),
-
-            "p50_latency_ms": (
-                float(percentiles[0])
-                if percentiles[0] is not None
-                else None
-            ),
-
-            "p95_latency_ms": (
-                float(percentiles[1])
-                if percentiles[1] is not None
-                else None
-            ),
-
-            "p99_latency_ms": (
-                float(percentiles[2])
-                if percentiles[2] is not None
-                else None
-            ),
+        "llm": {
+            "requests": llm_total,
+            "reliability": {
+                "successful": llm_success,
+                "errors": llm_errors,
+                "blocked": llm_blocked,
+                "running": llm_running,
+                "pending": llm_pending,
+                "success_rate": round(llm_success_rate, 2),
+                "error_rate": round(llm_error_rate, 2),
+                "blocked_rate": round(llm_blocked_rate, 2),
+            },
+            "performance": {
+                "average_latency_ms": float(llm[6] or 0),
+                "p50_latency_ms": (
+                    float(llm_percentiles[0])
+                    if llm_percentiles[0] is not None else None
+                ),
+                "p95_latency_ms": (
+                    float(llm_percentiles[1])
+                    if llm_percentiles[1] is not None else None
+                ),
+                "p99_latency_ms": (
+                    float(llm_percentiles[2])
+                    if llm_percentiles[2] is not None else None
+                ),
+            },
+            "cost": {
+                "total_cost_usd": float(llm[7] or 0),
+            },
+            "tokens": {
+                "input": llm[8] or 0,
+                "output": llm[9] or 0,
+                "total": (llm[8] or 0) + (llm[9] or 0),
+            },
+            "models": [
+                {
+                    "provider": row[0],
+                    "model": row[1],
+                    "requests": row[2],
+                    "successful": row[3],
+                    "errors": row[4],
+                    "blocked": row[5],
+                    "success_rate": round(
+                        row[3] / (row[3] + row[4] + row[5]) * 100,
+                        2,
+                    ) if (row[3] + row[4] + row[5]) else 0,
+                    "average_latency_ms": float(row[6] or 0),
+                    "cost_usd": float(row[7] or 0),
+                    "input_tokens": row[8] or 0,
+                    "output_tokens": row[9] or 0,
+                    "total_tokens": (row[8] or 0) + (row[9] or 0),
+                }
+                for row in model_rows
+            ],
         },
-
-        "cost": {
-            "total_cost_usd": float(
-                overall[7] or 0
+        "shadow": {
+            "evaluations": shadow_evaluated,
+            "scored": shadow_scored,
+            "pending": shadow_pending,
+            "supported": shadow_supported,
+            "partially_supported": shadow_partial,
+            "unsupported": shadow_unsupported,
+            "average_factuality_score": (
+                float(shadow[5]) if shadow[5] is not None else None
             ),
-        },
-
-        "tokens": {
-            "input": overall[8] or 0,
-            "output": overall[9] or 0,
-            "total": (
-                (overall[8] or 0)
-                + (overall[9] or 0)
-            ),
+            "supported_rate": round(
+                shadow_supported / shadow_scored * 100, 2
+            ) if shadow_scored else 0,
+            "partially_supported_rate": round(
+                shadow_partial / shadow_scored * 100, 2
+            ) if shadow_scored else 0,
+            "unsupported_rate": round(
+                shadow_unsupported / shadow_scored * 100, 2
+            ) if shadow_scored else 0,
         },
     }
 
