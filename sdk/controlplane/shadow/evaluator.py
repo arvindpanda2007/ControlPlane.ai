@@ -1064,39 +1064,65 @@ Return exactly this structure:
                 "confidence": 1.0,
             })
 
-        # Deduplicate by category + title.
+        # Consolidate recommendations by underlying issue, not merely
+        # by exact title. This prevents near-duplicates such as:
+        #   "Unsupported claims in output"
+        #   "Remove unsupported output claims"
+        # from becoming two separate recommendations.
         unique = {}
 
         for item in normalized:
-            category = str(
-                item.get("category") or ""
-            ).strip()
-
             title = str(
                 item.get("title") or ""
             ).strip()
 
-            key = (
-                category.lower(),
-                title.lower(),
-            )
-
             if not title:
                 continue
 
+            key = self._recommendation_group_key(item)
             existing = unique.get(key)
 
             if existing is None:
                 unique[key] = item
                 continue
 
-            # Keep the higher severity recommendation.
+            # Merge evidence instead of losing useful trace/span references.
+            existing_evidence = existing.get("evidence") or []
+            incoming_evidence = item.get("evidence") or []
+            existing["evidence"] = self._dedupe_evidence(
+                existing_evidence + incoming_evidence
+            )
+
+            # Prefer the higher severity.
             if self._severity_rank(
                 item.get("severity")
             ) > self._severity_rank(
                 existing.get("severity")
             ):
-                unique[key] = item
+                existing["severity"] = item.get("severity")
+
+            # Prefer the higher-confidence explanation.
+            existing_confidence = self._to_score(
+                existing.get("confidence")
+            ) or 0.0
+            incoming_confidence = self._to_score(
+                item.get("confidence")
+            ) or 0.0
+
+            if incoming_confidence > existing_confidence:
+                existing["confidence"] = incoming_confidence
+
+                if item.get("problem"):
+                    existing["problem"] = item["problem"]
+
+                if item.get("recommendation"):
+                    existing["recommendation"] = item["recommendation"]
+
+            # Keep the clearer/longer title when consolidating variants.
+            if len(str(item.get("title") or "")) > len(
+                str(existing.get("title") or "")
+            ):
+                existing["title"] = item["title"]
 
         result = list(unique.values())
 
@@ -1367,6 +1393,87 @@ Return exactly this structure:
             1.0,
             base,
         )
+
+    @staticmethod
+    def _recommendation_group_key(
+        recommendation: dict,
+    ) -> tuple:
+        """Return a stable issue-family key for recommendation consolidation."""
+
+        category = str(
+            recommendation.get("category") or "general"
+        ).strip().lower()
+
+        title = str(
+            recommendation.get("title") or ""
+        ).strip().lower()
+
+        problem = str(
+            recommendation.get("problem") or ""
+        ).strip().lower()
+
+        text = f"{category} {title} {problem}"
+
+        # Grounding/hallucination variants commonly describe the same
+        # underlying issue using different wording.
+        if (
+            category in {"grounding", "factuality", "hallucination"}
+            and any(
+                phrase in text
+                for phrase in (
+                    "unsupported claim",
+                    "unsupported output",
+                    "not supported by",
+                    "not supported",
+                    "outside the context",
+                    "beyond supplied context",
+                    "remove unsupported",
+                    "limit output claims",
+                )
+            )
+        ):
+            return ("grounding", "unsupported_claims")
+
+        if category in {
+            "context",
+            "context_quality",
+            "retrieval",
+        } and any(
+            phrase in text
+            for phrase in (
+                "insufficient context",
+                "missing context",
+                "context detail",
+                "context coverage",
+                "improve context",
+                "more relevant context",
+            )
+        ):
+            return ("context_quality", "insufficient_context")
+
+        if category in {"workflow", "flow", "tracing"}:
+            if "failed" in text:
+                return ("workflow", "failed_span")
+            if "parent" in text and "relationship" in text:
+                return ("tracing", "broken_parent")
+            if "ordering" in text:
+                return ("workflow", "ordering")
+
+        if category in {"tool", "tool_correctness"} and any(
+            phrase in text
+            for phrase in (
+                "tool failed",
+                "tool failure",
+                "incorrect tool",
+                "wrong tool",
+                "duplicate tool",
+            )
+        ):
+            return ("tool_correctness", "tool_execution")
+
+        # For unrelated recommendations retain category + normalized title.
+        normalized_title = " ".join(title.split())
+        return (category, normalized_title)
 
     @staticmethod
     def _severity_rank(
