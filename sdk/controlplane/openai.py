@@ -35,6 +35,12 @@ class OpenAIClient:
         )
 
         # ---------------------------------------------------------
+        # WORKFLOW TRACE ID
+        # ---------------------------------------------------------
+
+        parent_trace_id = trace.id if trace else None
+
+        # ---------------------------------------------------------
         # 1. INPUT / PROMPT INJECTION CHECK
         # ---------------------------------------------------------
 
@@ -58,6 +64,7 @@ class OpenAIClient:
                 safety_flag=True,
                 safety_type=",".join(error.matches),
                 safety_action="block",
+                parent_trace_id=parent_trace_id,
             )
 
             raise
@@ -176,6 +183,7 @@ class OpenAIClient:
                     safety_flag=True,
                     safety_type=",".join(error.violations),
                     safety_action="block",
+                    parent_trace_id=parent_trace_id,
                 )
 
                 raise
@@ -216,6 +224,7 @@ class OpenAIClient:
                 safety_flag=False,
                 safety_type=None,
                 safety_action=None,
+                parent_trace_id=parent_trace_id,
             )
 
             return response
@@ -257,6 +266,7 @@ class OpenAIClient:
                 safety_flag=False,
                 safety_type=None,
                 safety_action=None,
+                parent_trace_id=parent_trace_id,
             )
 
             raise

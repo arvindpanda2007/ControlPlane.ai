@@ -21,14 +21,7 @@ start = time.perf_counter()
 
 response = openai.chat(
     model="gpt-4.1-mini",
-    messages=[
-        {
-            "role": "user",
-            "content": (
-                "What is our refund policy?"
-            ),
-        }
-    ],
+    context="Company refund policy and eligibility requirements",
     context=(
         "Customers can request a refund within "
         "30 days of purchase."

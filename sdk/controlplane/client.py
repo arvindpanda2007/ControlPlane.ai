@@ -26,11 +26,68 @@ class ControlPlane:
     ):
         from .trace import Trace
 
-        return Trace(
+        trace = Trace(
             controlplane=self,
             name=name,
             session_id=session_id,
         )
+
+        # Create the parent workflow trace record immediately.
+        self._create_workflow_trace(
+            trace_id=trace.id,
+            name=name,
+            session_id=session_id,
+        )
+
+        return trace
+
+    def _create_workflow_trace(
+        self,
+        *,
+        trace_id: str,
+        name: str,
+        session_id: str | None,
+    ):
+        payload = {
+            "id": trace_id,
+            "provider": "controlplane",
+            "model": "workflow",
+            "input": name,
+            "output": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "latency_ms": None,
+            "estimated_cost_usd": None,
+            "context": None,
+            "session_id": session_id,
+            "status": "success",
+            "safety_flag": False,
+            "safety_type": None,
+            "safety_action": None,
+
+            # Parent workflow has no parent trace.
+            "parent_trace_id": None,
+        }
+
+        self._executor.submit(
+            self._send_workflow_trace,
+            payload,
+        )
+
+    def _send_workflow_trace(self, payload: dict):
+        try:
+            response = httpx.post(
+                f"{self.api_url}/traces",
+                json=payload,
+                timeout=5.0,
+            )
+
+            response.raise_for_status()
+
+        except Exception as error:
+            print(
+                f"ControlPlane workflow trace failed: {error}"
+            )
 
     # ---------------------------------------------------------
     # LLM TRACE
@@ -53,6 +110,7 @@ class ControlPlane:
         safety_flag: bool = False,
         safety_type: str | None = None,
         safety_action: str | None = None,
+        parent_trace_id: str | None = None,
     ):
         trace_id = str(uuid.uuid4())
 
@@ -72,12 +130,18 @@ class ControlPlane:
             "safety_flag": safety_flag,
             "safety_type": safety_type,
             "safety_action": safety_action,
+
+            # Link this LLM trace back to the workflow trace.
+            "parent_trace_id": parent_trace_id,
         }
 
         self._executor.submit(
             self._send_trace_and_evaluate,
             payload,
         )
+
+        # Return the generated trace ID.
+        return trace_id
 
     def _send_trace_and_evaluate(self, payload: dict):
         try:
@@ -97,6 +161,10 @@ class ControlPlane:
             # 2. Shadow evaluation
             # -------------------------------------------------
 
+            # Shadow remains asynchronous.
+            #
+            # Only evaluate successful traces that contain
+            # both context and output.
             if (
                 payload["status"] == "success"
                 and payload["context"]

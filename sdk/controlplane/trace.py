@@ -23,6 +23,10 @@ class Span:
         self.ended_at = None
         self.duration_ms = None
 
+    # ---------------------------------------------------------
+    # NESTED SPANS
+    # ---------------------------------------------------------
+
     def span(
         self,
         name: str,
@@ -37,19 +41,37 @@ class Span:
             metadata=metadata,
         )
 
+    # ---------------------------------------------------------
+    # START SPAN
+    # ---------------------------------------------------------
+
     def __enter__(self):
         self.started_at = time.perf_counter()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    # ---------------------------------------------------------
+    # FINISH SPAN
+    # ---------------------------------------------------------
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
         self.ended_at = time.perf_counter()
 
         self.duration_ms = int(
             (self.ended_at - self.started_at) * 1000
         )
 
-        status = "error" if exc_type else "success"
+        status = (
+            "error"
+            if exc_type
+            else "success"
+        )
 
+        # Record the completed span asynchronously.
         self.trace.controlplane.record_span(
             trace_id=self.trace.id,
             span_id=self.id,
@@ -61,6 +83,8 @@ class Span:
             metadata=self.metadata,
         )
 
+        # False means any exception should continue
+        # propagating to the caller.
         return False
 
 
@@ -72,15 +96,36 @@ class Trace:
         session_id: str | None = None,
     ):
         self.controlplane = controlplane
+
+        # This is the SINGLE canonical ID for the
+        # entire workflow.
         self.id = str(uuid.uuid4())
+
         self.name = name
         self.session_id = session_id
+
+    # ---------------------------------------------------------
+    # START TRACE
+    # ---------------------------------------------------------
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    # ---------------------------------------------------------
+    # FINISH TRACE
+    # ---------------------------------------------------------
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
         return False
+
+    # ---------------------------------------------------------
+    # CREATE ROOT SPAN
+    # ---------------------------------------------------------
 
     def span(
         self,

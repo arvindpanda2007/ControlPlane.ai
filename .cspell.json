@@ -1,0 +1,23 @@
+{
+  "version": "0.2",
+  "words": [
+    "controlplane",
+    "ControlPlane",
+    "factuality",
+    "OpenAI",
+    "Postgres",
+    "psycopg",
+    "uvicorn",
+    "FastAPI",
+    "Pydantic",
+    "llm",
+    "span",
+    "spans",
+    "trace",
+    "traces",
+    "ShadowWorker",
+    "parent_trace_id",
+    "estimated_cost_usd",
+    "session_id"
+  ]
+}
