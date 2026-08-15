@@ -13,7 +13,7 @@ import {
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
-const API_BASE = "https://customize-lending-diary-visitor.trycloudflare.com";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
 async function apiGet<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { signal: AbortSignal.timeout(10000) });
@@ -57,7 +57,42 @@ interface ApiSpan {
   duration_ms: number | null;
   status: string;
   metadata: Record<string, unknown>;
+  input?: string | null;
+  output?: string | null;
+  context?: string | null;
   children?: ApiSpan[];
+}
+
+interface ApiGraphNode {
+  id: string;
+  trace_id?: string;
+  parent_span_id?: string | null;
+  name: string;
+  span_type?: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  duration_ms?: number | null;
+  status?: string;
+  metadata?: Record<string, unknown>;
+  input?: string | null;
+  output?: string | null;
+  context?: string | null;
+}
+
+interface ApiGraphEdge {
+  source: string;
+  target: string;
+  type?: string;
+}
+
+interface ApiTraceDetail {
+  trace: ApiTrace;
+  spans: ApiSpan[];
+  graph?: {
+    root_trace_id?: string;
+    nodes?: ApiGraphNode[];
+    edges?: ApiGraphEdge[];
+  };
 }
 
 interface ApiInsights {
@@ -218,85 +253,160 @@ function flattenSpans(spans: ApiSpan[]): ApiSpan[] {
   return flat;
 }
 
-function layoutSpans(flatSpans: ApiSpan[]): { nodes: WFNode[]; edges: WFEdge[] } {
-  if (flatSpans.length === 0) return { nodes: [], edges: [] };
+function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: WFEdge[] } {
+  if (!detail) return { nodes: [], edges: [] };
 
-  const map = new Map(flatSpans.map(s => [s.id, s]));
+  const backendNodes = detail.graph?.nodes;
+  const backendEdges = detail.graph?.edges;
+  const flatSpans = flattenSpans(detail.spans || []);
+  const spanMap = new Map(flatSpans.map(s => [s.id, s]));
+
+  const sourceNodes: ApiGraphNode[] = backendNodes?.length
+    ? backendNodes
+    : flatSpans.map(s => ({
+        id: s.id,
+        trace_id: s.trace_id,
+        parent_span_id: s.parent_span_id,
+        name: s.name,
+        span_type: s.span_type,
+        started_at: s.started_at,
+        ended_at: s.ended_at,
+        duration_ms: s.duration_ms,
+        status: s.status,
+        metadata: s.metadata,
+        input: s.input,
+        output: s.output,
+        context: s.context,
+      }));
+
+  if (!sourceNodes.length) return { nodes: [], edges: [] };
+
+  const nodeMap = new Map(sourceNodes.map(n => [n.id, n]));
   const childrenOf = new Map<string, string[]>();
+  const parentsOf = new Map<string, string[]>();
+  sourceNodes.forEach(n => {
+    childrenOf.set(n.id, []);
+    parentsOf.set(n.id, []);
+  });
 
-  for (const s of flatSpans) {
-    if (!childrenOf.has(s.id)) childrenOf.set(s.id, []);
-    if (s.parent_span_id && map.has(s.parent_span_id)) {
-      childrenOf.get(s.parent_span_id)!.push(s.id);
+  const graphEdges: WFEdge[] = [];
+  const edgeKeys = new Set<string>();
+  const addEdge = (from: string, to: string) => {
+    if (!nodeMap.has(from) || !nodeMap.has(to) || from === to) return;
+    const key = `${from}->${to}`;
+    if (edgeKeys.has(key)) return;
+    edgeKeys.add(key);
+    graphEdges.push({ from, to });
+    childrenOf.get(from)!.push(to);
+    parentsOf.get(to)!.push(from);
+  };
+
+  // Use explicit topology first, then real parent_span_id relationships.
+  for (const e of (backendEdges || [])) addEdge(e.source, e.target);
+  if (!graphEdges.length) {
+    for (const n of sourceNodes) {
+      if (n.parent_span_id && nodeMap.has(n.parent_span_id)) {
+        addEdge(n.parent_span_id, n.id);
+      }
     }
   }
 
-  const roots = flatSpans.filter(s => !s.parent_span_id || !map.has(s.parent_span_id));
-  const hasNaturalEdges = flatSpans.some(s => s.parent_span_id && map.has(s.parent_span_id));
-
-  // When the backend gives flat siblings (no parent-child edges), chain them
-  // top-to-bottom by start time so the graph reads as a vertical sequence.
-  const syntheticEdges: WFEdge[] = [];
-  if (!hasNaturalEdges && roots.length > 1) {
-    const sorted = [...roots].sort((a, b) => {
-      if (!a.started_at) return 1;
-      if (!b.started_at) return -1;
-      return new Date(a.started_at).getTime() - new Date(b.started_at).getTime();
+  // IMPORTANT: the graph is rendered TOP -> BOTTOM. If the telemetry contains
+  // no usable incoming relationships, treat the recorded span sequence as a
+  // workflow chain. This fixes traces where Agent + LLM arrive as two roots.
+  // We only use this fallback when there is no usable topology at all.
+  if (!graphEdges.length && sourceNodes.length > 1) {
+    const ordered = [...sourceNodes].sort((a, b) => {
+      const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      const bt = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      return at - bt;
     });
-    sorted.forEach((s, i) => {
-      childrenOf.get(sorted[i === 0 ? 0 : i - 1].id)!; // already init'd above
-      if (i > 0) {
-        childrenOf.get(sorted[i - 1].id)!.push(s.id);
-        syntheticEdges.push({ from: sorted[i - 1].id, to: s.id });
-      }
-    });
-    // Re-root BFS from just the first node
-    roots.length = 0;
-    roots.push(sorted[0]);
+    for (let i = 1; i < ordered.length; i++) addEdge(ordered[i - 1].id, ordered[i].id);
   }
 
+  // If there are multiple roots but the backend supplied incomplete topology,
+  // connect orphan roots in execution order. Existing branch/merge edges stay
+  // untouched, so complex DAGs still render correctly.
+  if (graphEdges.length && sourceNodes.length > 1) {
+    const incoming = new Set(graphEdges.map(e => e.to));
+    const roots = sourceNodes
+      .filter(n => !incoming.has(n.id))
+      .sort((a, b) => {
+        const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+        const bt = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+        return at - bt;
+      });
+
+    // Only repair roots that look like later execution stages. Keep the first
+    // root as the true entry point and connect subsequent roots vertically.
+    if (roots.length > 1) {
+      for (let i = 1; i < roots.length; i++) addEdge(roots[i - 1].id, roots[i].id);
+    }
+  }
+
+  // Longest-path layering: every edge points downward. A merge node is placed
+  // below all of its parents, while sibling branches share the same Y level.
+  const indegree = new Map<string, number>();
   const levelOf = new Map<string, number>();
-  const queue: { id: string; lvl: number }[] = roots.map(r => ({ id: r.id, lvl: 0 }));
-  const seen = new Set<string>();
+  const queue: string[] = [];
+  sourceNodes.forEach(n => indegree.set(n.id, parentsOf.get(n.id)!.length));
+  sourceNodes.forEach(n => {
+    if ((indegree.get(n.id) || 0) === 0) {
+      levelOf.set(n.id, 0);
+      queue.push(n.id);
+    }
+  });
 
-  while (queue.length > 0) {
-    const { id, lvl } = queue.shift()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    levelOf.set(id, lvl);
-    (childrenOf.get(id) || []).forEach(cid => {
-      if (!seen.has(cid)) queue.push({ id: cid, lvl: lvl + 1 });
-    });
+  let head = 0;
+  while (head < queue.length) {
+    const id = queue[head++];
+    const next = (levelOf.get(id) || 0) + 1;
+    for (const child of childrenOf.get(id) || []) {
+      levelOf.set(child, Math.max(levelOf.get(child) ?? 0, next));
+      indegree.set(child, (indegree.get(child) || 0) - 1);
+      if (indegree.get(child) === 0) queue.push(child);
+    }
   }
 
-  const byLevel: string[][] = [];
-  for (const [id, lvl] of levelOf) {
-    if (!byLevel[lvl]) byLevel[lvl] = [];
-    byLevel[lvl].push(id);
+  let maxLevel = Math.max(0, ...levelOf.values());
+  sourceNodes.forEach(n => {
+    if (!levelOf.has(n.id)) levelOf.set(n.id, ++maxLevel);
+  });
+
+  const byLevel = new Map<number, ApiGraphNode[]>();
+  for (const n of sourceNodes) {
+    const level = levelOf.get(n.id) ?? 0;
+    if (!byLevel.has(level)) byLevel.set(level, []);
+    byLevel.get(level)!.push(n);
   }
 
-  const HGAP = 54, VGAP = 80;
+  // Vertical is the primary direction: Y is always the workflow stage.
+  // X only separates true sibling branches so they never overlap.
+  const HGAP = 70;
+  const VGAP = 90;
   const nodes: WFNode[] = [];
 
-  byLevel.forEach((ids, lvl) => {
-    const totalW = ids.length * NODE_W + (ids.length - 1) * HGAP;
-    ids.forEach((id, i) => {
-      const span = map.get(id)!;
-      const x = -totalW / 2 + i * (NODE_W + HGAP);
-      const y = lvl * (NODE_H + VGAP);
-      const meta = (span.metadata || {}) as Record<string, unknown>;
-      const kind = (KIND_COLOR[span.span_type] !== undefined
-        ? span.span_type : "tool") as NodeKind;
-      const childCount = (childrenOf.get(id) || []).length;
+  [...byLevel.keys()].sort((a, b) => a - b).forEach(level => {
+    const ids = byLevel.get(level)!;
+    const totalW = ids.length * NODE_W + Math.max(0, ids.length - 1) * HGAP;
+    ids.forEach((graphNode, i) => {
+      const span = spanMap.get(graphNode.id);
+      const meta = (graphNode.metadata || span?.metadata || {}) as Record<string, unknown>;
+      const spanType = graphNode.span_type || span?.span_type || "tool";
+      const kind = (KIND_COLOR[spanType] !== undefined ? spanType : "tool") as NodeKind;
+      const childCount = (childrenOf.get(graphNode.id) || []).length;
 
       nodes.push({
-        id: span.id,
-        name: span.name,
+        id: graphNode.id,
+        name: graphNode.name || span?.name || graphNode.id,
         kind,
-        duration: span.duration_ms || 0,
-        status: (["success", "error", "warning", "running", "blocked", "pending"]
-          .includes(span.status) ? span.status : "success") as RunStatus,
-        x, y,
+        duration: graphNode.duration_ms ?? span?.duration_ms ?? 0,
+        status: (['success', 'error', 'warning', 'running', 'blocked', 'pending']
+          .includes(graphNode.status || span?.status || 'success')
+          ? (graphNode.status || span?.status || 'success')
+          : 'success') as RunStatus,
+        x: -totalW / 2 + i * (NODE_W + HGAP),
+        y: level * (NODE_H + VGAP),
         model: meta.model as string | undefined,
         inputTokens: meta.input_tokens as number | undefined,
         outputTokens: meta.output_tokens as number | undefined,
@@ -306,11 +416,7 @@ function layoutSpans(flatSpans: ApiSpan[]): { nodes: WFNode[]; edges: WFEdge[] }
     });
   });
 
-  const naturalEdges: WFEdge[] = flatSpans
-    .filter(s => s.parent_span_id && map.has(s.parent_span_id))
-    .map(s => ({ from: s.parent_span_id!, to: s.id }));
-
-  return { nodes, edges: hasNaturalEdges ? naturalEdges : syntheticEdges };
+  return { nodes, edges: graphEdges };
 }
 
 function computeP95(values: number[]): number | null {
@@ -596,11 +702,11 @@ function WorkflowCanvas({ nodes, edges, selectedNodeId, highlightedNodeId, onSel
             <feComposite in="flood" in2="blur" operator="in" result="glow" />
             <feMerge><feMergeNode in="glow" /><feMergeNode in="SourceGraphic" /></feMerge>
           </filter>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="#52504d" />
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#52504d" />
           </marker>
-          <marker id="arrow-active" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="#f97316" />
+          <marker id="arrow-active" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#f97316" />
           </marker>
         </defs>
 
@@ -612,18 +718,28 @@ function WorkflowCanvas({ nodes, edges, selectedNodeId, highlightedNodeId, onSel
             const from = visibleNodes.find(n => n.id === e.from);
             const to = visibleNodes.find(n => n.id === e.to);
             if (!from || !to) return null;
-            const x1 = from.x + NODE_W / 2, y1 = from.y + NODE_H;
-            const x2 = to.x + NODE_W / 2, y2 = to.y - 8; // stop before arrowhead
-            const midY = (y1 + y2) / 2;
+
+            // Every edge leaves the bottom-center of the parent and enters the
+            // top-center of the child. This keeps the workflow visually
+            // top-to-bottom even when the graph branches or merges.
+            const x1 = from.x + NODE_W / 2;
+            const y1 = from.y + NODE_H;
+            const x2 = to.x + NODE_W / 2;
+            const y2 = to.y;
+            const distance = Math.max(30, y2 - y1);
+            const curve = Math.min(60, distance / 2);
             const isActive = selectedNodeId === e.from || selectedNodeId === e.to;
+
             return (
               <path
                 key={`${e.from}-${e.to}`}
-                d={`M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`}
+                d={`M ${x1} ${y1} C ${x1} ${y1 + curve}, ${x2} ${y2 - curve}, ${x2} ${y2}`}
                 fill="none"
-                stroke={isActive ? "#f97316" : "#42403d"}
-                strokeWidth={isActive ? 2 : 1.5}
+                stroke={isActive ? "#f97316" : "#52504d"}
+                strokeWidth={isActive ? 2.5 : 2}
+                strokeLinecap="round"
                 markerEnd={isActive ? "url(#arrow-active)" : "url(#arrow)"}
+                pointerEvents="none"
               />
             );
           })}
@@ -840,10 +956,11 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
   const shadow = insights?.shadow;
   const tabs = ["overview", "input", "context", "output", "quality"];
 
-  // Real I/O comes from the Shadow evaluation child trace (via insights).
-  // Span metadata has model/tokens/cost; the actual prompts live on the child trace.
-  const realInput = (meta.input as string) || shadowEval?.input || trace?.input || null;
-  const realContext = (meta.context as string) || shadowEval?.context || trace?.context || null;
+  // Prefer I/O recorded on the selected span. Shadow evaluation data is an
+  // evaluation signal, not a substitute for every workflow node's I/O.
+  const realInput = span?.input ?? (meta.input as string) ?? (node?.id === trace?.id ? trace?.input : null) ?? null;
+  const realContext = span?.context ?? (meta.context as string) ?? (node?.id === trace?.id ? trace?.context : null) ?? null;
+  const realOutput = span?.output ?? (meta.output as string) ?? (node?.id === trace?.id ? trace?.output : null) ?? null;
 
   return (
     <div className="flex flex-col h-full">
@@ -970,7 +1087,7 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
             <div className="text-xs text-cp-error">Failed to load output from backend.</div>
           ) : (
             <CodeBlock label="Output"
-              value={(meta.output as string) || childOutput || trace?.output || null} />
+              value={realOutput || childOutput || null} />
           )
         )}
 
@@ -1349,7 +1466,7 @@ interface TraceInvestigationProps {
 }
 
 function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: TraceInvestigationProps) {
-  const [detail, setDetail] = useState<{ trace: ApiTrace; spans: ApiSpan[] } | null>(null);
+  const [detail, setDetail] = useState<ApiTraceDetail | null>(null);
   const [insights, setInsights] = useState<ApiInsights | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1363,7 +1480,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
     setHighlightedNodeId(null);
 
     Promise.all([
-      apiGet<{ trace: ApiTrace; spans: ApiSpan[] }>(`/traces/${traceId}`),
+      apiGet<ApiTraceDetail>(`/traces/${traceId}`),
       apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
     ]).then(([d, ins]) => {
       setDetail(d);
@@ -1373,7 +1490,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   }, [traceId]);
 
   const flatSpans = detail ? flattenSpans(detail.spans) : [];
-  const { nodes, edges } = layoutSpans(flatSpans);
+  const { nodes, edges } = layoutGraph(detail);
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) ?? null : null;
   const currentTrace = detail?.trace ?? sessionTraces.find(t => t.id === traceId) ?? null;
   const factScore = currentTrace?.factuality_score;
