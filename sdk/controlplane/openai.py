@@ -79,6 +79,9 @@ class OpenAIClient:
             llm_span = trace.span(
                 "openai",
                 span_type="llm",
+
+                # Record the exact input sent to this step.
+                input=input_text,
             )
 
             llm_span.__enter__()
@@ -104,6 +107,10 @@ class OpenAIClient:
             output_text = (
                 response.choices[0].message.content or ""
             )
+
+            # Record the exact output produced by this step.
+            if llm_span:
+                llm_span.output = output_text
 
             # -----------------------------------------------------
             # 5. EXTRACT TOKEN USAGE

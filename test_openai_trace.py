@@ -19,7 +19,10 @@ with controlplane.start_trace(
     with trace.span(
         "agent",
         span_type="agent",
-    ):
+    ) as agent_span:
+
+        # Record the agent's input.
+        agent_span.input = "What is artificial intelligence?"
 
         response = openai.chat(
             model="gpt-4.1-mini",
@@ -40,11 +43,20 @@ with controlplane.start_trace(
             trace=trace,
         )
 
+        output_text = (
+            response.choices[0].message.content or ""
+        )
+
+        # Record the agent's output.
+        agent_span.output = output_text
+
         print("Response:")
-        print(response.choices[0].message.content)
+        print(output_text)
 
         print()
         print("Trace:", trace.id)
+
+controlplane.flush()
 
 print()
 print("OpenAI trace test complete.")
