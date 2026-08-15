@@ -1,0 +1,2298 @@
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import {
+  Search, Settings, Activity, BarChart2, DollarSign, Shield,
+  AlertTriangle, ChevronRight, ChevronLeft, X, Plus, Minus,
+  RefreshCw, ArrowRight, Grid3x3, LayoutList, CheckCircle,
+  Clock, Cpu, TrendingUp, Loader2, AlertCircle, Command,
+  XCircle, Zap,
+} from "lucide-react";
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, PieChart, Pie, Cell,
+} from "recharts";
+
+// ─── API ──────────────────────────────────────────────────────────────────────
+
+const API_BASE = "https://customize-lending-diary-visitor.trycloudflare.com";
+
+async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+  return res.json() as Promise<T>;
+}
+
+// ─── API Types ────────────────────────────────────────────────────────────────
+
+interface ApiTrace {
+  id: string;
+  created_at: string;
+  provider: string;
+  model: string;
+  input: string;
+  output: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  latency_ms: number | null;
+  estimated_cost_usd: number | null;
+  context: string | null;
+  session_id: string | null;
+  status: string;
+  safety_flag: boolean;
+  safety_type: string | null;
+  safety_action: string | null;
+  parent_trace_id: string | null;
+  factuality_score: number | null;
+  factuality_status: string | null;
+  evaluated_at: string | null;
+}
+
+interface ApiSpan {
+  id: string;
+  trace_id: string;
+  parent_span_id: string | null;
+  name: string;
+  span_type: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_ms: number | null;
+  status: string;
+  metadata: Record<string, unknown>;
+  children?: ApiSpan[];
+}
+
+interface ApiInsights {
+  trace_id: string;
+  summary: string;
+  performance?: {
+    workflow_latency_ms: number | null;
+    cost_usd: number | null;
+    bottleneck?: {
+      span_id: string;
+      name: string;
+      span_type: string;
+      duration_ms: number;
+      latency_share: number;
+      status: string;
+    };
+  };
+  shadow?: {
+    evaluations: number;
+    evaluated: number;
+    average_factuality_score: number | null;
+    supported: number;
+    partially_supported: number;
+    unsupported: number;
+    pending: number;
+  };
+  shadow_evaluations?: Array<{
+    trace_id: string;
+    provider?: string;
+    model?: string;
+    factuality_score: number | null;
+    factuality_status: string | null;
+    input: string;
+    has_output?: boolean;
+    context: string | null;
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    latency_ms: number | null;
+    estimated_cost_usd: number | null;
+    status?: string;
+    evaluated_at?: string | null;
+  }>;
+  recommendations: string[];
+  performance_recommendations?: string[];
+  quality_recommendations?: string[];
+}
+
+interface ApiAnalytics {
+  overview: {
+    total_requests: number;
+    average_latency_ms: number;
+    total_cost_usd: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
+    successful_requests: number;
+    error_requests: number;
+    blocked_requests: number;
+  };
+  models: Array<{
+    model: string;
+    requests: number;
+    average_latency_ms: number;
+    total_cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+  }>;
+  spans: Array<{
+    span_type: string;
+    count: number;
+    average_duration_ms: number;
+    total_duration_ms: number;
+  }>;
+  slowest_spans: Array<{
+    trace_id: string;
+    name: string;
+    span_type: string;
+    duration_ms: number;
+    status: string;
+  }>;
+  most_expensive_requests: Array<{
+    trace_id: string;
+    model: string;
+    estimated_cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+    latency_ms: number;
+  }>;
+}
+
+// ─── Canvas Types ─────────────────────────────────────────────────────────────
+
+type NodeKind = "agent" | "llm" | "retrieval" | "tool" | "database" | "postprocess" | "chain";
+type RunStatus = "success" | "warning" | "error" | "running" | "blocked" | "pending";
+
+interface WFNode {
+  id: string;
+  name: string;
+  kind: NodeKind;
+  model?: string;
+  duration: number;
+  status: RunStatus;
+  x: number;
+  y: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cost?: number;
+  childCount?: number;
+}
+
+interface WFEdge { from: string; to: string; }
+
+// ─── App State ────────────────────────────────────────────────────────────────
+
+type Screen = "home" | "app" | "trace";
+
+interface AppGroup {
+  sessionId: string;
+  name: string;
+  traces: ApiTrace[];           // Root workflow traces (the actual runs).
+  reliability: number;
+  quality: number | null;       // Avg factuality from Shadow child traces.
+  p95Latency: number | null;
+  avgLatency: number | null;
+  totalCost: number;
+  safetyFlags: number;
+  lastActivity: string | null;
+  health: "healthy" | "warning" | "critical";
+  // Shadow evaluation counts (from child traces).
+  shadowCounts: { supported: number; partial: number; unsupported: number; pending: number; total: number };
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const NODE_W = 186;
+const NODE_H = 94;
+
+const KIND_COLOR: Record<string, string> = {
+  agent: "#7c3aed",
+  llm: "#2563eb",
+  retrieval: "#16a34a",
+  tool: "#d97706",
+  database: "#b45309",
+  postprocess: "#64748b",
+  chain: "#9333ea",
+};
+
+const DRILLABLE = new Set(["agent", "chain"]);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function flattenSpans(spans: ApiSpan[]): ApiSpan[] {
+  const flat: ApiSpan[] = [];
+  function walk(s: ApiSpan) {
+    flat.push(s);
+    (s.children || []).forEach(walk);
+  }
+  spans.forEach(walk);
+  return flat;
+}
+
+function layoutSpans(flatSpans: ApiSpan[]): { nodes: WFNode[]; edges: WFEdge[] } {
+  if (flatSpans.length === 0) return { nodes: [], edges: [] };
+
+  const map = new Map(flatSpans.map(s => [s.id, s]));
+  const childrenOf = new Map<string, string[]>();
+
+  for (const s of flatSpans) {
+    if (!childrenOf.has(s.id)) childrenOf.set(s.id, []);
+    if (s.parent_span_id && map.has(s.parent_span_id)) {
+      childrenOf.get(s.parent_span_id)!.push(s.id);
+    }
+  }
+
+  const roots = flatSpans.filter(s => !s.parent_span_id || !map.has(s.parent_span_id));
+  const hasNaturalEdges = flatSpans.some(s => s.parent_span_id && map.has(s.parent_span_id));
+
+  // When the backend gives flat siblings (no parent-child edges), chain them
+  // top-to-bottom by start time so the graph reads as a vertical sequence.
+  const syntheticEdges: WFEdge[] = [];
+  if (!hasNaturalEdges && roots.length > 1) {
+    const sorted = [...roots].sort((a, b) => {
+      if (!a.started_at) return 1;
+      if (!b.started_at) return -1;
+      return new Date(a.started_at).getTime() - new Date(b.started_at).getTime();
+    });
+    sorted.forEach((s, i) => {
+      childrenOf.get(sorted[i === 0 ? 0 : i - 1].id)!; // already init'd above
+      if (i > 0) {
+        childrenOf.get(sorted[i - 1].id)!.push(s.id);
+        syntheticEdges.push({ from: sorted[i - 1].id, to: s.id });
+      }
+    });
+    // Re-root BFS from just the first node
+    roots.length = 0;
+    roots.push(sorted[0]);
+  }
+
+  const levelOf = new Map<string, number>();
+  const queue: { id: string; lvl: number }[] = roots.map(r => ({ id: r.id, lvl: 0 }));
+  const seen = new Set<string>();
+
+  while (queue.length > 0) {
+    const { id, lvl } = queue.shift()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    levelOf.set(id, lvl);
+    (childrenOf.get(id) || []).forEach(cid => {
+      if (!seen.has(cid)) queue.push({ id: cid, lvl: lvl + 1 });
+    });
+  }
+
+  const byLevel: string[][] = [];
+  for (const [id, lvl] of levelOf) {
+    if (!byLevel[lvl]) byLevel[lvl] = [];
+    byLevel[lvl].push(id);
+  }
+
+  const HGAP = 54, VGAP = 80;
+  const nodes: WFNode[] = [];
+
+  byLevel.forEach((ids, lvl) => {
+    const totalW = ids.length * NODE_W + (ids.length - 1) * HGAP;
+    ids.forEach((id, i) => {
+      const span = map.get(id)!;
+      const x = -totalW / 2 + i * (NODE_W + HGAP);
+      const y = lvl * (NODE_H + VGAP);
+      const meta = (span.metadata || {}) as Record<string, unknown>;
+      const kind = (KIND_COLOR[span.span_type] !== undefined
+        ? span.span_type : "tool") as NodeKind;
+      const childCount = (childrenOf.get(id) || []).length;
+
+      nodes.push({
+        id: span.id,
+        name: span.name,
+        kind,
+        duration: span.duration_ms || 0,
+        status: (["success", "error", "warning", "running", "blocked", "pending"]
+          .includes(span.status) ? span.status : "success") as RunStatus,
+        x, y,
+        model: meta.model as string | undefined,
+        inputTokens: meta.input_tokens as number | undefined,
+        outputTokens: meta.output_tokens as number | undefined,
+        cost: (meta.cost as number | undefined) ?? (meta.estimated_cost_usd as number | undefined),
+        childCount: childCount > 0 ? childCount : undefined,
+      });
+    });
+  });
+
+  const naturalEdges: WFEdge[] = flatSpans
+    .filter(s => s.parent_span_id && map.has(s.parent_span_id))
+    .map(s => ({ from: s.parent_span_id!, to: s.id }));
+
+  return { nodes, edges: hasNaturalEdges ? naturalEdges : syntheticEdges };
+}
+
+function computeP95(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
+}
+
+function groupTracesBySession(allTraces: ApiTrace[]): AppGroup[] {
+  const map = new Map<string, ApiTrace[]>();
+  for (const t of allTraces) {
+    const key = t.session_id || "default";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(t);
+  }
+
+  return [...map.entries()].map(([sessionId, sessionTraces]) => {
+    // Root workflow traces are the actual runs (no parent).
+    // Child traces are Shadow LLM evaluation records (have parent_trace_id).
+    const rootTraces = sessionTraces.filter(t => t.parent_trace_id === null);
+    const childTraces = sessionTraces.filter(t => t.parent_trace_id !== null);
+
+    // Reliability from root (workflow) traces only.
+    const successful = rootTraces.filter(t => t.status === "success").length;
+    const reliability = rootTraces.length > 0
+      ? (successful / rootTraces.length) * 100 : 0;
+
+    // Quality from Shadow child traces that have a factuality score.
+    const evaluatedChildren = childTraces.filter(t => t.factuality_score != null);
+    const quality = evaluatedChildren.length > 0
+      ? (evaluatedChildren.reduce((s, t) => s + (t.factuality_score || 0), 0) / evaluatedChildren.length) * 100
+      : null;
+
+    // Latency from root traces (end-to-end workflow latency).
+    const latencies = rootTraces.filter(t => t.latency_ms != null).map(t => t.latency_ms!);
+    const p95Latency = computeP95(latencies);
+    const avgLatency = latencies.length > 0
+      ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null;
+
+    // Cost from child traces (they carry the real LLM token costs).
+    const totalCost = childTraces.reduce((s, t) => s + (t.estimated_cost_usd || 0), 0);
+
+    // Safety flags from all traces.
+    const safetyFlags = sessionTraces.filter(t => t.safety_flag).length;
+
+    // Shadow quality distribution counts from child traces.
+    const shadowCounts = {
+      supported: childTraces.filter(t => t.factuality_status === "supported").length,
+      partial: childTraces.filter(t => t.factuality_status === "partially_supported").length,
+      unsupported: childTraces.filter(t => t.factuality_status === "unsupported").length,
+      pending: childTraces.filter(t => t.factuality_score == null).length,
+      total: childTraces.length,
+    };
+
+    const sorted = [...rootTraces].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    const lastActivity = sorted[0]?.created_at || null;
+
+    let health: "healthy" | "warning" | "critical" = "healthy";
+    if (reliability < 90 || (quality != null && quality < 80)) health = "critical";
+    else if (reliability < 97 || (quality != null && quality < 90) || safetyFlags > 0) health = "warning";
+
+    const name = sessionId === "default"
+      ? "All Traces"
+      : sessionId.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+    return {
+      sessionId, name,
+      traces: sorted, // Root workflow traces only — shown in workspace runs list.
+      reliability, quality, p95Latency, avgLatency,
+      totalCost, safetyFlags, lastActivity, health, shadowCounts,
+    };
+  }).sort((a, b) => {
+    const ta = a.lastActivity ? new Date(a.lastActivity).getTime() : 0;
+    const tb = b.lastActivity ? new Date(b.lastActivity).getTime() : 0;
+    return tb - ta;
+  });
+}
+
+function fmtMs(ms: number | null | undefined): string {
+  if (ms == null) return "N/A";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+
+function fmtCost(usd: number | null | undefined): string {
+  if (usd == null) return "N/A";
+  if (usd === 0) return "$0.00";
+  if (usd < 0.0001) return `<$0.0001`;
+  return `$${usd.toFixed(4)}`;
+}
+
+function fmtTime(iso: string | null | undefined): string {
+  if (!iso) return "N/A";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+function statusColor(s: string): string {
+  if (s === "success") return "#16a34a";
+  if (s === "error" || s === "blocked") return "#dc2626";
+  if (s === "warning") return "#d97706";
+  if (s === "running") return "#2563eb";
+  if (s === "pending") return "#6b6b68";
+  return "#9e9e9b";
+}
+
+function healthColor(h: "healthy" | "warning" | "critical"): string {
+  return h === "healthy" ? "#16a34a" : h === "warning" ? "#d97706" : "#dc2626";
+}
+
+// ─── Canvas Helpers ───────────────────────────────────────────────────────────
+
+function getSubtreeIds(rootId: string, nodes: WFNode[], edges: WFEdge[]): Set<string> {
+  const visited = new Set<string>();
+  const queue = [rootId];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    edges.filter(e => e.from === id).forEach(e => queue.push(e.to));
+  }
+  return visited;
+}
+
+function getHiddenByCollapse(collapsedIds: Set<string>, nodes: WFNode[], edges: WFEdge[]): Set<string> {
+  const hidden = new Set<string>();
+  for (const cid of collapsedIds) {
+    const sub = getSubtreeIds(cid, nodes, edges);
+    sub.delete(cid);
+    sub.forEach(nid => hidden.add(nid));
+  }
+  return hidden;
+}
+
+// ─── WorkflowCanvas ───────────────────────────────────────────────────────────
+
+interface CanvasProps {
+  nodes: WFNode[];
+  edges: WFEdge[];
+  selectedNodeId: string | null;
+  highlightedNodeId: string | null;
+  onSelectNode: (id: string | null) => void;
+}
+
+function WorkflowCanvas({ nodes, edges, selectedNodeId, highlightedNodeId, onSelectNode }: CanvasProps) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [tf, setTf] = useState({ x: 0, y: 0, scale: 0.85 });
+  const [panning, setPanning] = useState(false);
+  const panStart = useRef({ mx: 0, my: 0, tx: 0, ty: 0 });
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [drillPath, setDrillPath] = useState<string[]>([]);
+  const [collapsedIds, setCollapsedIds] = useState(new Set<string>());
+
+  const drillId = drillPath[drillPath.length - 1] ?? null;
+  const subtreeIds = drillId ? getSubtreeIds(drillId, nodes, edges) : null;
+  const hiddenIds = getHiddenByCollapse(collapsedIds, nodes, edges);
+  const visibleNodes = nodes.filter(n =>
+    (!subtreeIds || subtreeIds.has(n.id)) && !hiddenIds.has(n.id)
+  );
+  const visibleEdges = edges.filter(e =>
+    visibleNodes.some(n => n.id === e.from) && visibleNodes.some(n => n.id === e.to)
+  );
+
+  const visibleNodesRef = useRef(visibleNodes);
+  visibleNodesRef.current = visibleNodes;
+
+  const fitView = useCallback(() => {
+    const vn = visibleNodesRef.current;
+    if (!svgRef.current || vn.length === 0) return;
+    const { width, height } = svgRef.current.getBoundingClientRect();
+    const xs = vn.map(n => n.x);
+    const ys = vn.map(n => n.y);
+    const pad = 32;
+    const minX = Math.min(...xs) - pad, minY = Math.min(...ys) - pad;
+    const maxX = Math.max(...xs) + NODE_W + pad, maxY = Math.max(...ys) + NODE_H + pad;
+    const scale = Math.min(width / (maxX - minX), height / (maxY - minY), 1.2);
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    setTf({ x: width / 2 - cx * scale, y: height / 2 - cy * scale, scale });
+  }, []); // stable — reads visibleNodesRef at call time
+
+  // Re-fit only when the set of visible node IDs actually changes.
+  const visibleNodeIds = visibleNodes.map(n => n.id).join(",");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { fitView(); }, [visibleNodeIds]);
+
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      const d = e.deltaY < 0 ? 1.1 : 0.9;
+      setTf(t => ({
+        scale: Math.min(3, Math.max(0.15, t.scale * d)),
+        x: mx - (mx - t.x) * d,
+        y: my - (my - t.y) * d,
+      }));
+    };
+    svg.addEventListener("wheel", handler, { passive: false });
+    return () => svg.removeEventListener("wheel", handler);
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (drillPath.length > 0) setDrillPath(p => p.slice(0, -1));
+        else onSelectNode(null);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [drillPath, onSelectNode]);
+
+  const onMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    setPanning(true);
+    panStart.current = { mx: e.clientX, my: e.clientY, tx: tf.x, ty: tf.y };
+  };
+  const onMouseMove = (e: React.MouseEvent) => {
+    if (!panning) return;
+    setTf(t => ({
+      ...t,
+      x: panStart.current.tx + e.clientX - panStart.current.mx,
+      y: panStart.current.ty + e.clientY - panStart.current.my,
+    }));
+  };
+  const onMouseUp = () => setPanning(false);
+
+  const showKindLabel = tf.scale >= 0.55;
+  const showModel = tf.scale >= 0.65;
+  const showDuration = tf.scale >= 0.55;
+  const showChildCount = tf.scale >= 0.65;
+  const showCostLine = tf.scale >= 1.35;
+
+  // Minimap bounds
+  const allXs = nodes.map(n => n.x), allYs = nodes.map(n => n.y);
+  const mmMinX = nodes.length ? Math.min(...allXs) - 20 : -200;
+  const mmMaxX = nodes.length ? Math.max(...allXs) + NODE_W + 20 : 200;
+  const mmMinY = nodes.length ? Math.min(...allYs) - 20 : -100;
+  const mmMaxY = nodes.length ? Math.max(...allYs) + NODE_H + 20 : 100;
+  const mmW = 140, mmH = 80;
+  const mmScale = Math.min(mmW / (mmMaxX - mmMinX), mmH / (mmMaxY - mmMinY));
+
+  if (nodes.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-cp-secondary text-sm">
+        No spans recorded for this trace.
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative flex-1 overflow-hidden bg-cp-canvas">
+      <svg
+        ref={svgRef}
+        className="w-full h-full select-none"
+        style={{ cursor: panning ? "grabbing" : "grab" }}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseUp}
+        onClick={() => onSelectNode(null)}
+      >
+        <defs>
+          <pattern id="dots" patternUnits="userSpaceOnUse" width="24" height="24">
+            <circle cx="1" cy="1" r="0.8" fill="#2a2826" />
+          </pattern>
+          <filter id="node-glow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur" />
+            <feFlood floodOpacity="0.3" result="flood" />
+            <feComposite in="flood" in2="blur" operator="in" result="glow" />
+            <feMerge><feMergeNode in="glow" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+          <filter id="amber-glow" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="blur" />
+            <feFlood floodColor="#d97706" floodOpacity="0.5" result="flood" />
+            <feComposite in="flood" in2="blur" operator="in" result="glow" />
+            <feMerge><feMergeNode in="glow" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#52504d" />
+          </marker>
+          <marker id="arrow-active" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L8,3 z" fill="#f97316" />
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="url(#dots)" />
+
+        <g transform={`translate(${tf.x},${tf.y}) scale(${tf.scale})`}>
+          {/* Edges */}
+          {visibleEdges.map(e => {
+            const from = visibleNodes.find(n => n.id === e.from);
+            const to = visibleNodes.find(n => n.id === e.to);
+            if (!from || !to) return null;
+            const x1 = from.x + NODE_W / 2, y1 = from.y + NODE_H;
+            const x2 = to.x + NODE_W / 2, y2 = to.y - 8; // stop before arrowhead
+            const midY = (y1 + y2) / 2;
+            const isActive = selectedNodeId === e.from || selectedNodeId === e.to;
+            return (
+              <path
+                key={`${e.from}-${e.to}`}
+                d={`M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`}
+                fill="none"
+                stroke={isActive ? "#f97316" : "#42403d"}
+                strokeWidth={isActive ? 2 : 1.5}
+                markerEnd={isActive ? "url(#arrow-active)" : "url(#arrow)"}
+              />
+            );
+          })}
+
+          {/* Nodes */}
+          {visibleNodes.map(node => {
+            const isSel = selectedNodeId === node.id;
+            const isHov = hoveredId === node.id;
+            const isHL = highlightedNodeId === node.id;
+            const kc = KIND_COLOR[node.kind] || "#6e7a8a";
+            const sc = statusColor(node.status);
+            const isDrillable = DRILLABLE.has(node.kind);
+            const isCol = collapsedIds.has(node.id);
+
+            return (
+              <g
+                key={node.id}
+                transform={`translate(${node.x},${node.y})`}
+                style={{ cursor: "pointer" }}
+                onClick={e => { e.stopPropagation(); onSelectNode(node.id); }}
+                onDoubleClick={e => {
+                  e.stopPropagation();
+                  if (!isDrillable) return;
+                  setDrillPath(p => [...p, node.id]);
+                  onSelectNode(null);
+                }}
+                onMouseEnter={() => setHoveredId(node.id)}
+                onMouseLeave={() => setHoveredId(null)}
+              >
+                {/* Amber highlight ring */}
+                {isHL && (
+                  <rect x={-7} y={-7} width={NODE_W + 14} height={NODE_H + 14} rx={7}
+                    fill="none" stroke="#d97706" strokeWidth={2} opacity={0.75}
+                    filter="url(#amber-glow)">
+                    <animate attributeName="opacity" values="0.75;0.2;0.75" dur="1.8s" repeatCount="indefinite" />
+                  </rect>
+                )}
+
+                {/* Selection / hover ring */}
+                {(isSel || isHov) && (
+                  <rect x={-3} y={-3} width={NODE_W + 6} height={NODE_H + 6} rx={7}
+                    fill="none" stroke={isSel ? kc : "rgba(255,255,255,0.18)"} strokeWidth={isSel ? 1.5 : 1} />
+                )}
+
+                {/* Card — dark surface */}
+                <rect x={0} y={0} width={NODE_W} height={NODE_H} rx={6}
+                  fill={isSel ? "#2e2c2a" : "#262422"} stroke={isSel ? kc + "80" : "#3a3835"} strokeWidth={1} />
+                {/* Top accent bar */}
+                <rect x={0} y={0} width={NODE_W} height={3} rx={3} fill={kc} opacity={0.9} />
+                {/* Header area */}
+                <rect x={0} y={3} width={NODE_W} height={19} fill={kc} opacity={0.08} />
+
+                {showKindLabel && (
+                  <text x={10} y={16} fontSize={8.5} fill={kc} fontFamily="'Geist',sans-serif"
+                    fontWeight={700} style={{ textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                    {node.kind}
+                  </text>
+                )}
+                <circle cx={NODE_W - 10} cy={12} r={3} fill={sc} />
+
+                <line x1={0} y1={22} x2={NODE_W} y2={22} stroke="rgba(255,255,255,0.06)" />
+
+                <text x={10} y={40} fontSize={12} fill="#f0efed" fontFamily="'Geist',sans-serif" fontWeight={500}>
+                  {node.name.length > 20 ? node.name.slice(0, 18) + "…" : node.name}
+                </text>
+
+                {showModel && node.model && (
+                  <text x={10} y={55} fontSize={9.5} fill="#7a7875" fontFamily="'Geist Mono',monospace">
+                    {node.model.length > 22 ? node.model.slice(0, 20) + "…" : node.model}
+                  </text>
+                )}
+
+                {isHov && isDrillable && !node.model && (
+                  <text x={10} y={55} fontSize={9} fill={kc} fontFamily="'Geist',sans-serif" opacity={0.7}>
+                    double-click to drill in
+                  </text>
+                )}
+
+                <line x1={0} y1={72} x2={NODE_W} y2={72} stroke="rgba(255,255,255,0.06)" />
+
+                {showDuration && (
+                  <text x={10} y={86} fontSize={9.5} fill="#5e5c5a"
+                    fontFamily="'Geist Mono',monospace">
+                    {showCostLine && node.cost != null ? fmtCost(node.cost) : fmtMs(node.duration)}
+                  </text>
+                )}
+
+                {showChildCount && node.childCount && node.childCount > 0 && (
+                  <g onClick={e => {
+                    e.stopPropagation();
+                    setCollapsedIds(s => {
+                      const n = new Set(s);
+                      n.has(node.id) ? n.delete(node.id) : n.add(node.id);
+                      return n;
+                    });
+                  }}>
+                    <rect x={NODE_W - 38} y={77} width={30} height={12} rx={3}
+                      fill={isCol ? kc + "33" : "rgba(255,255,255,0.08)"} stroke="rgba(255,255,255,0.12)" strokeWidth={0.5} />
+                    <text x={NODE_W - 23} y={87} fontSize={8.5} fill="#7a7875"
+                      fontFamily="'Geist',sans-serif" textAnchor="middle">
+                      {isCol ? `+${node.childCount}` : `−${node.childCount}`}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          })}
+        </g>
+      </svg>
+
+      {/* Minimap */}
+      <div className="absolute bottom-14 right-4 rounded border border-white/10 bg-black/40 p-1.5">
+        <svg width={mmW} height={mmH}>
+          {visibleNodes.map(n => (
+            <rect key={n.id}
+              x={(n.x - mmMinX) * mmScale} y={(n.y - mmMinY) * mmScale}
+              width={NODE_W * mmScale} height={NODE_H * mmScale}
+              rx={1} fill={KIND_COLOR[n.kind] || "#6e7a8a"}
+              opacity={selectedNodeId === n.id ? 0.9 : 0.4} />
+          ))}
+        </svg>
+      </div>
+
+      {/* Drill breadcrumb */}
+      {drillPath.length > 0 && (
+        <div className="absolute top-3 left-3 flex items-center gap-1.5 text-xs bg-black/50 border border-white/10 rounded px-2 py-1 text-white/70">
+          <button onClick={() => setDrillPath([])} className="text-cp-blue hover:underline">Root</button>
+          {drillPath.map((id, i) => {
+            const n = nodes.find(n => n.id === id);
+            return (
+              <span key={id} className="flex items-center gap-1">
+                <ChevronRight size={10} className="text-cp-muted" />
+                <button onClick={() => setDrillPath(p => p.slice(0, i + 1))}
+                  className="text-cp-text hover:text-cp-blue">
+                  {n?.name || id.slice(0, 8)}
+                </button>
+              </span>
+            );
+          })}
+          <button onClick={() => setDrillPath(p => p.slice(0, -1))} className="ml-1 text-cp-muted hover:text-cp-error">
+            <X size={10} />
+          </button>
+        </div>
+      )}
+
+      {/* Zoom controls */}
+      <div className="absolute bottom-4 right-4 flex flex-col gap-1">
+        {[
+          { icon: <Minus size={12} />, action: () => setTf(t => ({ ...t, scale: Math.max(0.15, t.scale * 0.8) })) },
+          { icon: <span className="text-xs font-mono">fit</span>, action: fitView },
+          { icon: <Plus size={12} />, action: () => setTf(t => ({ ...t, scale: Math.min(3, t.scale * 1.2) })) },
+        ].map((btn, i) => (
+          <button key={i} onClick={btn.action}
+            className="w-7 h-7 flex items-center justify-center bg-black/40 border border-white/10 rounded text-white/50 hover:text-white/90 transition-colors">
+            {btn.icon}
+          </button>
+        ))}
+      </div>
+
+      <div className="absolute bottom-4 left-4 text-xs text-white/40 font-mono bg-black/30 border border-white/10 rounded px-1.5 py-0.5">
+        {Math.round(tf.scale * 100)}%
+      </div>
+    </div>
+  );
+}
+
+// ─── Node Inspector ───────────────────────────────────────────────────────────
+
+interface InspectorProps {
+  node: WFNode | null;
+  trace: ApiTrace | null;
+  flatSpans: ApiSpan[];
+  insights: ApiInsights | null;
+  onHighlightNode: (id: string | null) => void;
+}
+
+function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: InspectorProps) {
+  const [tab, setTab] = useState("overview");
+  // Lazily fetched output from the Shadow child trace.
+  const [childOutput, setChildOutput] = useState<string | null | "loading" | "error">(null);
+
+  const span = node ? flatSpans.find(s => s.id === node.id) : null;
+
+  // Shadow evaluation record most relevant to this node (typically just one per trace).
+  const shadowEval = insights?.shadow_evaluations?.[0] ?? null;
+
+  // When user clicks "output" tab, fetch the child trace to get the actual LLM output.
+  useEffect(() => {
+    if (tab !== "output" || !shadowEval?.trace_id) return;
+    if (childOutput !== null) return; // already fetched or loading
+    setChildOutput("loading");
+    apiGet<{ trace: ApiTrace; spans: ApiSpan[] }>(`/traces/${shadowEval.trace_id}`)
+      .then(d => setChildOutput(d.trace.output || null))
+      .catch(() => setChildOutput("error"));
+  }, [tab, shadowEval, childOutput]);
+
+  // Reset child output when the node changes.
+  useEffect(() => { setChildOutput(null); }, [node?.id]);
+
+  if (!node && !trace) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-cp-secondary text-sm p-6 text-center">
+        Click a node to inspect
+      </div>
+    );
+  }
+
+  if (!node) {
+    return <TraceOverviewPane trace={trace} insights={insights} onHighlightNode={onHighlightNode} />;
+  }
+
+  const meta = (span?.metadata || {}) as Record<string, unknown>;
+  const isBottleneck = insights?.performance?.bottleneck?.span_id === node.id;
+  const shadow = insights?.shadow;
+  const tabs = ["overview", "input", "context", "output", "quality"];
+
+  // Real I/O comes from the Shadow evaluation child trace (via insights).
+  // Span metadata has model/tokens/cost; the actual prompts live on the child trace.
+  const realInput = (meta.input as string) || shadowEval?.input || trace?.input || null;
+  const realContext = (meta.context as string) || shadowEval?.context || trace?.context || null;
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="p-4 border-b border-cp-border flex-shrink-0">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs px-2 py-0.5 rounded font-semibold uppercase tracking-wide"
+            style={{ background: KIND_COLOR[node.kind] + "22", color: KIND_COLOR[node.kind] }}>
+            {node.kind}
+          </span>
+          <div className="flex items-center gap-2">
+            {isBottleneck && (
+              <span className="text-xs bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded font-medium">Bottleneck</span>
+            )}
+            <span className="w-2 h-2 rounded-full" style={{ background: statusColor(node.status) }} />
+            <span className="text-xs text-cp-secondary capitalize">{node.status}</span>
+          </div>
+        </div>
+
+        <div className="text-base font-semibold text-cp-text">{node.name}</div>
+        {node.model && (
+          <div className="text-xs text-cp-secondary font-mono mt-0.5">{node.model}</div>
+        )}
+
+        <div className="flex gap-4 mt-3">
+          <div>
+            <div className="text-xs text-cp-muted">Latency</div>
+            <div className="text-sm font-mono text-cp-text">{fmtMs(node.duration)}</div>
+          </div>
+          {node.cost != null && (
+            <div>
+              <div className="text-xs text-cp-muted">Cost</div>
+              <div className="text-sm font-mono text-cp-text">{fmtCost(node.cost)}</div>
+            </div>
+          )}
+          {node.inputTokens != null && (
+            <div>
+              <div className="text-xs text-cp-muted">Tokens</div>
+              <div className="text-sm font-mono text-cp-text">
+                {(node.inputTokens + (node.outputTokens || 0)).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex border-b border-cp-border flex-shrink-0">
+        {tabs.map(t => (
+          <button key={t} onClick={() => setTab(t)}
+            className={`px-3 py-2 text-xs font-medium capitalize transition-colors ${
+              tab === t ? "text-cp-text border-b border-cp-purple -mb-px" : "text-cp-secondary hover:text-cp-text"
+            }`}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {tab === "overview" && (
+          <>
+            {isBottleneck && insights?.performance?.bottleneck && (
+              <div className="rounded-lg border border-cp-border bg-cp-surface p-3">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                  <div className="text-xs font-semibold text-cp-text">Performance Bottleneck</div>
+                </div>
+                <div className="text-xs text-cp-secondary">
+                  {insights.performance.bottleneck.latency_share.toFixed(1)}% of total recorded span time
+                </div>
+              </div>
+            )}
+
+            <div>
+              <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">Span Details</div>
+              <div className="space-y-1.5">
+                {([
+                  ["Span ID", node.id.slice(0, 16) + "…"],
+                  ["Type", node.kind],
+                  ["Status", node.status],
+                  ["Duration", fmtMs(node.duration)],
+                  ...(node.model ? [["Model", node.model] as [string, string]] : []),
+                  ...(node.inputTokens != null ? [["In Tokens", String(node.inputTokens)] as [string, string]] : []),
+                  ...(node.outputTokens != null ? [["Out Tokens", String(node.outputTokens)] as [string, string]] : []),
+                  ...(node.cost != null ? [["Cost", fmtCost(node.cost)] as [string, string]] : []),
+                ] as [string, string][]).map(([k, v]) => (
+                  <div key={k} className="flex justify-between text-xs">
+                    <span className="text-cp-secondary">{k}</span>
+                    <span className="text-cp-text font-mono">{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {insights?.recommendations && insights.recommendations.length > 0 && (
+              <div>
+                <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">Recommendations</div>
+                <div className="space-y-2">
+                  {insights.recommendations.map((rec, i) => (
+                    <button key={i} onClick={() => onHighlightNode(node.id)}
+                      className="w-full text-left text-xs text-cp-secondary bg-cp-surface border border-cp-border rounded-lg p-2.5 hover:border-cp-border-strong hover:bg-cp-elevated transition-colors">
+                      <AlertTriangle size={10} className="inline mr-1.5 text-cp-warning" />
+                      {rec}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "input" && (
+          <CodeBlock label="Input" value={realInput} />
+        )}
+
+        {tab === "context" && (
+          <CodeBlock label="Context / Retrieved Documents" value={realContext} />
+        )}
+
+        {tab === "output" && (
+          childOutput === "loading" ? (
+            <div className="flex items-center gap-2 text-cp-secondary text-xs">
+              <Loader2 size={12} className="animate-spin" /> Loading output…
+            </div>
+          ) : childOutput === "error" ? (
+            <div className="text-xs text-cp-error">Failed to load output from backend.</div>
+          ) : (
+            <CodeBlock label="Output"
+              value={(meta.output as string) || childOutput || trace?.output || null} />
+          )
+        )}
+
+        {tab === "quality" && (
+          <ShadowQualityPane shadow={shadow} shadowEvals={insights?.shadow_evaluations ?? []} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CodeBlock({ label, value }: { label: string; value: string | null }) {
+  if (!value) {
+    return (
+      <div>
+        <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">{label}</div>
+        <div className="text-xs text-cp-muted italic">N/A — not recorded for this span</div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">{label}</div>
+      <pre className="text-xs text-cp-text font-mono bg-cp-elevated rounded p-3 whitespace-pre-wrap break-words border border-cp-border max-h-96 overflow-y-auto">
+        {value}
+      </pre>
+    </div>
+  );
+}
+
+type ShadowEval = NonNullable<ApiInsights["shadow_evaluations"]>[number];
+
+function ShadowQualityPane({
+  shadow,
+  shadowEvals = [],
+}: {
+  shadow: ApiInsights["shadow"];
+  shadowEvals?: ShadowEval[];
+}) {
+  if (!shadow || shadow.evaluations === 0) {
+    return <div className="text-xs text-cp-muted italic">No Shadow evaluations for this trace.</div>;
+  }
+
+  const statusLabel: Record<string, string> = {
+    supported: "Supported",
+    partially_supported: "Partially Supported",
+    unsupported: "Unsupported",
+  };
+
+  const statusBg: Record<string, string> = {
+    supported: "#3fb95022",
+    partially_supported: "#d2992222",
+    unsupported: "#f8514922",
+  };
+
+  const statusFg: Record<string, string> = {
+    supported: "#16a34a",
+    partially_supported: "#d97706",
+    unsupported: "#dc2626",
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="text-xs text-cp-muted uppercase tracking-wider">Shadow Quality</div>
+
+      {shadow.average_factuality_score != null && (
+        <div>
+          <div className="flex justify-between mb-1">
+            <span className="text-xs text-cp-secondary">Factuality Score</span>
+            <span className="text-xs font-mono text-cp-text">
+              {(shadow.average_factuality_score * 100).toFixed(0)}%
+            </span>
+          </div>
+          <div className="h-1.5 rounded-full bg-cp-elevated">
+            <div className="h-full rounded-full transition-all" style={{
+              width: `${shadow.average_factuality_score * 100}%`,
+              background: shadow.average_factuality_score >= 0.8 ? "#16a34a"
+                : shadow.average_factuality_score >= 0.6 ? "#d97706" : "#dc2626",
+            }} />
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-3 gap-2 text-center">
+        {[
+          { label: "Supported", val: shadow.supported, color: "#16a34a" },
+          { label: "Partial", val: shadow.partially_supported, color: "#d97706" },
+          { label: "Unsupported", val: shadow.unsupported, color: "#dc2626" },
+        ].map(item => (
+          <div key={item.label} className="bg-cp-elevated rounded p-2 border border-cp-border">
+            <div className="text-lg font-bold"
+              style={{ color: item.val > 0 ? item.color : "#9e9e9b" }}>{item.val}</div>
+            <div className="text-xs text-cp-muted">{item.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {shadow.pending > 0 && (
+        <div className="text-xs text-cp-secondary flex items-center gap-1">
+          <Loader2 size={10} className="animate-spin" /> {shadow.pending} evaluation(s) pending
+        </div>
+      )}
+
+      {/* Individual shadow evaluation records */}
+      {shadowEvals.length > 0 && (
+        <div>
+          <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">Evaluation Details</div>
+          <div className="space-y-3">
+            {shadowEvals.map((ev) => (
+              <div key={ev.trace_id} className="bg-cp-elevated border border-cp-border rounded p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono text-cp-muted">{ev.trace_id.slice(0, 12)}…</span>
+                  {ev.factuality_status && (
+                    <span className="text-xs px-1.5 py-0.5 rounded font-medium"
+                      style={{
+                        background: statusBg[ev.factuality_status] || "#42505e22",
+                        color: statusFg[ev.factuality_status] || "#6b6b68",
+                      }}>
+                      {statusLabel[ev.factuality_status] || ev.factuality_status}
+                    </span>
+                  )}
+                </div>
+
+                {ev.factuality_score != null && (
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 h-1 rounded-full bg-cp-app">
+                      <div className="h-full rounded-full" style={{
+                        width: `${ev.factuality_score * 100}%`,
+                        background: ev.factuality_score >= 0.8 ? "#16a34a"
+                          : ev.factuality_score >= 0.6 ? "#d97706" : "#dc2626",
+                      }} />
+                    </div>
+                    <span className="text-xs font-mono text-cp-text w-8 text-right">
+                      {(ev.factuality_score * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  {ev.input_tokens != null && (
+                    <div>
+                      <div className="text-cp-muted">In tokens</div>
+                      <div className="text-cp-text font-mono">{ev.input_tokens}</div>
+                    </div>
+                  )}
+                  {ev.output_tokens != null && (
+                    <div>
+                      <div className="text-cp-muted">Out tokens</div>
+                      <div className="text-cp-text font-mono">{ev.output_tokens}</div>
+                    </div>
+                  )}
+                  {ev.estimated_cost_usd != null && (
+                    <div>
+                      <div className="text-cp-muted">Cost</div>
+                      <div className="text-cp-text font-mono">{fmtCost(ev.estimated_cost_usd)}</div>
+                    </div>
+                  )}
+                </div>
+
+                {ev.evaluated_at && (
+                  <div className="text-xs text-cp-muted">Evaluated {fmtTime(ev.evaluated_at)}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">Detailed Dimensions</div>
+        {["Grounding", "Relevance", "Completeness", "Flow Accuracy", "Safety"].map(m => (
+          <div key={m} className="flex justify-between py-1.5 border-b border-cp-border/50 text-xs last:border-0">
+            <span className="text-cp-secondary">{m}</span>
+            <span className="text-cp-muted">N/A</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TraceOverviewPane({ trace, insights, onHighlightNode }: {
+  trace: ApiTrace | null;
+  insights: ApiInsights | null;
+  onHighlightNode: (id: string | null) => void;
+}) {
+  if (!trace) return null;
+  const shadow = insights?.shadow;
+  const bottleneck = insights?.performance?.bottleneck;
+
+  const factColor = shadow?.average_factuality_score != null
+    ? shadow.average_factuality_score >= 0.8 ? "#16a34a" : shadow.average_factuality_score >= 0.6 ? "#d97706" : "#dc2626"
+    : null;
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+
+      {/* Trace identity */}
+      <div className="px-4 pt-3 pb-3 border-b border-cp-border">
+        <div className="flex items-center gap-2 mb-1.5">
+          <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: statusColor(trace.status) }} />
+          <span className="text-sm font-semibold text-cp-text capitalize">{trace.status}</span>
+          <span className="text-xs text-cp-muted ml-auto">{fmtTime(trace.created_at)}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono text-cp-muted">{trace.id.slice(0, 18)}…</span>
+          {trace.model && (
+            <span className="ml-auto text-xs font-mono text-cp-muted bg-cp-elevated rounded px-1.5 py-0.5 flex-shrink-0">{trace.model}</span>
+          )}
+        </div>
+      </div>
+
+      <div className="p-4 space-y-3">
+
+        {/* Metrics grid */}
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { label: "Latency", value: fmtMs(trace.latency_ms) },
+            { label: "Cost", value: fmtCost(trace.estimated_cost_usd) },
+            { label: "In Tokens", value: trace.input_tokens != null ? trace.input_tokens.toLocaleString() : "N/A" },
+            { label: "Out Tokens", value: trace.output_tokens != null ? trace.output_tokens.toLocaleString() : "N/A" },
+          ].map(({ label, value }) => (
+            <div key={label} className="bg-cp-elevated rounded-lg p-3 border border-cp-border">
+              <div className="text-xs text-cp-muted mb-1">{label}</div>
+              <div className="text-base font-mono font-semibold text-cp-text">{value}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Safety flag */}
+        {trace.safety_flag && (
+          <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs">
+            <div className="flex items-center gap-1.5 text-red-600 font-semibold mb-1">
+              <Shield size={12} /> Safety Flag
+            </div>
+            {trace.safety_type && <div className="text-red-500">Type: {trace.safety_type}</div>}
+            {trace.safety_action && <div className="text-red-500">Action: {trace.safety_action}</div>}
+          </div>
+        )}
+
+        {/* Shadow Quality card */}
+        {shadow && (
+          <div className="rounded-lg border border-cp-border bg-cp-surface overflow-hidden">
+            <div className="px-3 py-2 border-b border-cp-border bg-cp-elevated flex items-center justify-between">
+              <span className="text-xs font-semibold text-cp-text">Shadow Quality</span>
+              {shadow.average_factuality_score != null && (
+                <span className="text-xs font-mono font-bold" style={{ color: factColor ?? undefined }}>
+                  {(shadow.average_factuality_score * 100).toFixed(0)}%
+                </span>
+              )}
+            </div>
+            <div className="p-3 space-y-2">
+              {shadow.average_factuality_score != null ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-cp-secondary flex-1">Factuality</span>
+                    <div className="w-28 h-1.5 rounded-full bg-cp-elevated overflow-hidden">
+                      <div className="h-full rounded-full transition-all" style={{
+                        width: `${shadow.average_factuality_score * 100}%`,
+                        background: factColor ?? "#6b6b68",
+                      }} />
+                    </div>
+                  </div>
+                  <div className="flex gap-3 text-xs pt-1">
+                    {[
+                      { label: "Supported", val: shadow.supported, color: "#16a34a" },
+                      { label: "Partial", val: shadow.partially_supported, color: "#d97706" },
+                      { label: "Unsupported", val: shadow.unsupported, color: "#dc2626" },
+                    ].map(item => (
+                      <div key={item.label} className="flex flex-col items-center gap-0.5">
+                        <span className="font-mono font-semibold" style={{ color: item.val > 0 ? item.color : "#9e9e9b" }}>
+                          {item.val}
+                        </span>
+                        <span className="text-cp-muted" style={{ fontSize: 9 }}>{item.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs text-cp-muted py-1">
+                  {shadow.pending > 0 ? "Evaluation pending…" : "Not evaluated"}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Performance card */}
+        {bottleneck && (
+          <div className="rounded-lg border border-cp-border bg-cp-surface overflow-hidden">
+            <div className="px-3 py-2 border-b border-cp-border bg-cp-elevated">
+              <span className="text-xs font-semibold text-cp-text">Performance</span>
+            </div>
+            <div className="p-3">
+              <div className="text-xs text-cp-muted mb-0.5">Primary bottleneck</div>
+              <div className="text-sm font-semibold text-cp-text">{bottleneck.name}</div>
+              <div className="text-xs text-cp-muted mt-1">
+                {fmtMs(bottleneck.duration_ms)} · {bottleneck.latency_share.toFixed(1)}% of span time
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Recommendations */}
+        {insights?.recommendations && insights.recommendations.length > 0 && (
+          <div className="rounded-lg border border-cp-border bg-cp-surface overflow-hidden">
+            <div className="px-3 py-2 border-b border-cp-border bg-cp-elevated">
+              <span className="text-xs font-semibold text-cp-text">Recommendations</span>
+            </div>
+            <div className="divide-y divide-cp-border">
+              {insights.recommendations.map((rec, i) => (
+                <button key={i} onClick={() => onHighlightNode(bottleneck?.span_id || null)}
+                  className="w-full text-left px-3 py-2.5 text-xs text-cp-secondary hover:bg-cp-elevated transition-colors flex gap-2">
+                  <AlertTriangle size={11} className="text-amber-500 flex-shrink-0 mt-0.5" />
+                  <span>{rec}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Shadow evaluations */}
+        {insights?.shadow_evaluations && insights.shadow_evaluations.length > 0 && (
+          <div className="rounded-lg border border-cp-border bg-cp-surface overflow-hidden">
+            <div className="px-3 py-2 border-b border-cp-border bg-cp-elevated">
+              <span className="text-xs font-semibold text-cp-text">Shadow Evaluations</span>
+            </div>
+            <div className="divide-y divide-cp-border">
+              {insights.shadow_evaluations.map(ev => {
+                const sc = ev.factuality_status === "supported" ? "#16a34a"
+                  : ev.factuality_status === "partially_supported" ? "#d97706"
+                  : ev.factuality_status === "unsupported" ? "#dc2626" : "#6b6b68";
+                return (
+                  <div key={ev.trace_id} className="px-3 py-2.5 space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono text-cp-muted">{ev.trace_id.slice(0, 10)}…</span>
+                      {ev.factuality_score != null && (
+                        <span className="text-xs font-mono font-bold" style={{ color: sc }}>
+                          {(ev.factuality_score * 100).toFixed(0)}%
+                        </span>
+                      )}
+                    </div>
+                    {ev.factuality_status && (
+                      <span className="inline-block text-xs px-2 py-0.5 rounded-full font-medium"
+                        style={{ background: sc + "18", color: sc }}>
+                        {ev.factuality_status.replace(/_/g, " ")}
+                      </span>
+                    )}
+                    {ev.input && (
+                      <div className="text-xs text-cp-muted truncate">{ev.input.slice(0, 60)}{ev.input.length > 60 ? "…" : ""}</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {insights?.summary && (
+          <div className="text-xs text-cp-secondary bg-cp-elevated border border-cp-border rounded p-3">
+            {insights.summary}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Trace Investigation ──────────────────────────────────────────────────────
+
+interface TraceInvestigationProps {
+  traceId: string;
+  sessionTraces: ApiTrace[];
+  onSelectTrace: (id: string) => void;
+  onBack: () => void;
+}
+
+function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: TraceInvestigationProps) {
+  const [detail, setDetail] = useState<{ trace: ApiTrace; spans: ApiSpan[] } | null>(null);
+  const [insights, setInsights] = useState<ApiInsights | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    setSelectedNodeId(null);
+    setHighlightedNodeId(null);
+
+    Promise.all([
+      apiGet<{ trace: ApiTrace; spans: ApiSpan[] }>(`/traces/${traceId}`),
+      apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
+    ]).then(([d, ins]) => {
+      setDetail(d);
+      setInsights(ins);
+    }).catch(err => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [traceId]);
+
+  const flatSpans = detail ? flattenSpans(detail.spans) : [];
+  const { nodes, edges } = layoutSpans(flatSpans);
+  const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) ?? null : null;
+  const currentTrace = detail?.trace ?? sessionTraces.find(t => t.id === traceId) ?? null;
+  const factScore = currentTrace?.factuality_score;
+
+  return (
+    <div className="flex flex-col h-screen bg-cp-app">
+      {/* Header */}
+      <div className="flex items-center gap-3 px-4 h-12 border-b border-cp-border flex-shrink-0 bg-cp-surface">
+        <button onClick={onBack}
+          className="flex items-center gap-1.5 text-xs text-cp-secondary hover:text-cp-text transition-colors">
+          <ChevronLeft size={14} /> Back
+        </button>
+        <div className="w-px h-4 bg-cp-border" />
+        <span className="text-xs font-medium text-cp-text">
+          Run #{sessionTraces.length - sessionTraces.findIndex(t => t.id === traceId)}
+        </span>
+        <span className="text-xs text-cp-muted font-mono">{traceId.slice(0, 8)}…</span>
+        {currentTrace && (
+          <>
+            <span className="w-1.5 h-1.5 rounded-full" style={{ background: statusColor(currentTrace.status) }} />
+            <span className="text-xs text-cp-secondary capitalize">{currentTrace.status}</span>
+            <div className="w-px h-4 bg-cp-border" />
+            <span className="text-xs text-cp-muted">{fmtMs(currentTrace.latency_ms)}</span>
+            {currentTrace.estimated_cost_usd != null && (
+              <span className="text-xs text-cp-muted">{fmtCost(currentTrace.estimated_cost_usd)}</span>
+            )}
+          </>
+        )}
+        <div className="flex-1" />
+        {factScore != null && (
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="text-cp-muted">Quality</span>
+            <span className="font-mono" style={{
+              color: factScore >= 0.8 ? "#16a34a" : factScore >= 0.6 ? "#d97706" : "#dc2626"
+            }}>
+              {(factScore * 100).toFixed(0)}%
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* 3-pane layout */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left: trace list */}
+        <div className="w-56 border-r border-cp-border flex flex-col flex-shrink-0 bg-cp-surface">
+          <div className="px-3 py-2 border-b border-cp-border">
+            <div className="text-xs font-medium text-cp-secondary">Recent Traces</div>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {sessionTraces.map((t, i) => {
+              const runNum = sessionTraces.length - i;
+              const d = new Date(t.created_at);
+              const dateLabel = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+              const timeLabel = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
+              return (
+                <button key={t.id} onClick={() => onSelectTrace(t.id)}
+                  className={`w-full text-left px-3 py-3 border-b border-cp-border/50 transition-colors hover:bg-cp-hover ${
+                    t.id === traceId ? "bg-cp-active border-l-2 border-l-cp-purple" : ""
+                  }`}>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                      style={{ background: statusColor(t.status) }} />
+                    <span className="text-xs font-medium text-cp-text">Run #{runNum}</span>
+                  </div>
+                  <div className="text-xs text-cp-muted pl-3">{dateLabel} · {timeLabel}</div>
+                  <div className="flex gap-2 mt-1 pl-3 text-xs text-cp-muted">
+                    <span>{fmtMs(t.latency_ms)}</span>
+                    {t.factuality_score != null && (
+                      <span style={{
+                        color: t.factuality_score >= 0.8 ? "#16a34a"
+                          : t.factuality_score >= 0.6 ? "#d97706" : "#dc2626"
+                      }}>
+                        {(t.factuality_score * 100).toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Center: canvas with grey outer frame */}
+        <div className="flex-1 flex flex-col overflow-hidden bg-cp-elevated p-3">
+          <div className="flex-1 flex flex-col rounded-xl overflow-hidden border border-cp-border/40 shadow-sm">
+            {loading ? (
+              <div className="flex-1 flex items-center justify-center text-cp-secondary text-sm gap-2 bg-cp-canvas">
+                <Loader2 size={16} className="animate-spin" /> Loading trace…
+              </div>
+            ) : error ? (
+              <div className="flex-1 flex items-center justify-center text-cp-error text-sm bg-cp-canvas">
+                Failed to load: {error}
+              </div>
+            ) : (
+              <WorkflowCanvas
+                nodes={nodes}
+                edges={edges}
+                selectedNodeId={selectedNodeId}
+                highlightedNodeId={highlightedNodeId}
+                onSelectNode={setSelectedNodeId}
+              />
+            )}
+          </div>
+        </div>
+
+        {/* Right: inspector */}
+        <div className="w-80 border-l border-cp-border flex flex-col flex-shrink-0 bg-cp-surface overflow-hidden">
+          {loading ? (
+            <div className="flex-1 flex items-center justify-center text-cp-muted text-xs gap-2">
+              <Loader2 size={14} className="animate-spin" /> Loading…
+            </div>
+          ) : (
+            <NodeInspector
+              node={selectedNode}
+              trace={currentTrace}
+              flatSpans={flatSpans}
+              insights={insights}
+              onHighlightNode={setHighlightedNodeId}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Application Workspace ────────────────────────────────────────────────────
+
+type AppTab = "overview" | "traces" | "analytics" | "reliability" | "quality" | "cost" | "safety";
+
+interface AppWorkspaceProps {
+  app: AppGroup;
+  onBack: () => void;
+  onSelectTrace: (id: string) => void;
+}
+
+function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps) {
+  const [tab, setTab] = useState<AppTab>("overview");
+  const [analytics, setAnalytics] = useState<ApiAnalytics | null>(null);
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    apiGet<ApiAnalytics>("/analytics").then(setAnalytics).catch(() => {});
+  }, []);
+
+  const filtered = app.traces.filter(t =>
+    !search ||
+    t.id.toLowerCase().includes(search.toLowerCase()) ||
+    (t.model || "").toLowerCase().includes(search.toLowerCase()) ||
+    t.status.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const totalTokens = app.traces.reduce(
+    (s, t) => s + (t.input_tokens || 0) + (t.output_tokens || 0), 0
+  );
+  const errorTraces = app.traces.filter(t => t.status === "error" || t.status === "blocked");
+  const safetyTraces = app.traces.filter(t => t.safety_flag);
+  const latencyBuckets = [500, 1000, 2000, 5000, Infinity];
+  const latencyLabels = ["<0.5s", "0.5–1s", "1–2s", "2–5s", ">5s"];
+  const latencyData = latencyLabels.map((label, i) => ({
+    label,
+    count: app.traces.filter(t => {
+      const ms = t.latency_ms || 0;
+      const lo = latencyBuckets[i - 1] || 0;
+      return ms >= lo && ms < latencyBuckets[i];
+    }).length,
+  }));
+
+  // Use shadowCounts from AppGroup — child Shadow traces are the ones with factuality data.
+  const qualityData = [
+    { name: "Supported", value: app.shadowCounts.supported, color: "#16a34a" },
+    { name: "Partial", value: app.shadowCounts.partial, color: "#d97706" },
+    { name: "Unsupported", value: app.shadowCounts.unsupported, color: "#dc2626" },
+  ].filter(d => d.value > 0);
+
+  const TABS: { id: AppTab; label: string }[] = [
+    { id: "overview", label: "Overview" },
+    { id: "traces", label: "Traces" },
+    { id: "analytics", label: "Analytics" },
+    { id: "reliability", label: "Reliability" },
+    { id: "quality", label: "Quality" },
+    { id: "cost", label: "Cost" },
+    { id: "safety", label: "Safety" },
+  ];
+
+  const hc = healthColor(app.health);
+
+  return (
+    <div className="flex flex-col h-screen bg-cp-app">
+      {/* App header */}
+      <div className="flex items-center gap-4 px-6 h-14 border-b border-cp-border flex-shrink-0 bg-cp-surface">
+        <button onClick={onBack}
+          className="flex items-center gap-1.5 text-xs text-cp-secondary hover:text-cp-text transition-colors">
+          <ChevronLeft size={14} /> Applications
+        </button>
+        <div className="w-px h-4 bg-cp-border" />
+        <div>
+          <div className="text-sm font-semibold text-cp-text">{app.name}</div>
+          <div className="text-xs text-cp-muted font-mono">{app.sessionId}</div>
+        </div>
+        <div className="flex items-center gap-1.5 ml-1">
+          <span className="w-2 h-2 rounded-full" style={{ background: hc }} />
+          <span className="text-xs font-medium capitalize" style={{ color: hc }}>{app.health}</span>
+        </div>
+        <div className="flex-1" />
+        <div className="flex items-center gap-4 text-xs text-cp-secondary">
+          <span>Reliability <span className="text-cp-text font-mono ml-1">{app.reliability.toFixed(1)}%</span></span>
+          {app.quality != null && <span>Quality <span className="text-cp-text font-mono ml-1">{app.quality.toFixed(0)}%</span></span>}
+          {app.p95Latency != null && <span>P95 <span className="text-cp-text font-mono ml-1">{fmtMs(app.p95Latency)}</span></span>}
+          <span className="text-cp-muted">{app.traces.length} traces</span>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex border-b border-cp-border bg-cp-surface flex-shrink-0">
+        {TABS.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`px-4 py-2.5 text-xs font-medium transition-colors whitespace-nowrap ${
+              tab === t.id
+                ? "text-cp-text border-b-2 border-cp-purple -mb-px bg-cp-app"
+                : "text-cp-secondary hover:text-cp-text"
+            }`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-6">
+        {/* OVERVIEW */}
+        {tab === "overview" && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              {[
+                { label: "Total Traces", value: String(app.traces.length), icon: Activity },
+                { label: "Reliability", value: `${app.reliability.toFixed(1)}%`, icon: CheckCircle,
+                  color: app.reliability >= 97 ? "#16a34a" : app.reliability >= 90 ? "#d97706" : "#dc2626" },
+                { label: "Quality", value: app.quality != null ? `${app.quality.toFixed(0)}%` : "N/A",
+                  icon: Zap,
+                  color: app.quality == null ? "#6b6b68" : app.quality >= 90 ? "#16a34a" : app.quality >= 80 ? "#d97706" : "#dc2626" },
+                { label: "P95 Latency", value: fmtMs(app.p95Latency), icon: Clock },
+                { label: "Avg Latency", value: fmtMs(app.avgLatency), icon: TrendingUp },
+                { label: "Total Cost", value: fmtCost(app.totalCost), icon: DollarSign },
+                { label: "Total Tokens", value: totalTokens > 0 ? totalTokens.toLocaleString() : "N/A", icon: Cpu },
+                { label: "Safety Flags", value: String(app.safetyFlags), icon: Shield,
+                  color: app.safetyFlags > 0 ? "#dc2626" : "#16a34a" },
+              ].map(({ label, value, icon: Icon, color }) => (
+                <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs text-cp-muted">{label}</span>
+                    <Icon size={14} className="text-cp-muted" />
+                  </div>
+                  <div className="text-xl font-bold font-mono" style={{ color: color || "#1a1a18" }}>
+                    {value}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div>
+              <div className="text-sm font-medium text-cp-text mb-3">Recent Traces</div>
+              <div className="bg-cp-surface border border-cp-border rounded-lg overflow-hidden">
+                {app.traces.slice(0, 8).map((t, i) => (
+                  <button key={t.id} onClick={() => onSelectTrace(t.id)}
+                    className={`w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+                    <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: statusColor(t.status) }} />
+                    <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
+                    <span className="text-xs text-cp-muted">{fmtTime(t.created_at)}</span>
+                    <span className="text-xs font-mono text-cp-secondary w-16 text-right">{fmtMs(t.latency_ms)}</span>
+                    {t.factuality_score != null && (
+                      <span className="text-xs font-mono w-10 text-right" style={{
+                        color: t.factuality_score >= 0.8 ? "#16a34a" : t.factuality_score >= 0.6 ? "#d97706" : "#dc2626"
+                      }}>
+                        {(t.factuality_score * 100).toFixed(0)}%
+                      </span>
+                    )}
+                    <ArrowRight size={12} className="text-cp-muted" />
+                  </button>
+                ))}
+                {app.traces.length === 0 && (
+                  <div className="px-4 py-8 text-center text-xs text-cp-muted">No traces yet.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TRACES */}
+        {tab === "traces" && (
+          <div className="space-y-4">
+            <div className="relative max-w-sm">
+              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-cp-muted" />
+              <input value={search} onChange={e => setSearch(e.target.value)}
+                placeholder="Search by ID, model, status…"
+                className="w-full bg-cp-elevated border border-cp-border rounded pl-8 pr-3 py-2 text-xs text-cp-text placeholder-cp-muted outline-none focus:border-cp-border-strong" />
+            </div>
+
+            <div className="bg-cp-surface border border-cp-border rounded-lg overflow-hidden">
+              <div className="flex items-center gap-3 px-4 py-2 border-b border-cp-border text-xs text-cp-muted">
+                <span className="w-5" />
+                <span className="flex-1">Trace ID</span>
+                <span className="w-28">Model</span>
+                <span className="w-20 text-right">Latency</span>
+                <span className="w-16 text-right">Cost</span>
+                <span className="w-14 text-right">Quality</span>
+                <span className="w-20 text-right">Time</span>
+                <span className="w-4" />
+              </div>
+              {filtered.map((t, i) => (
+                <button key={t.id} onClick={() => onSelectTrace(t.id)}
+                  className={`w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+                  <span className="w-5 flex justify-center">
+                    <span className="w-1.5 h-1.5 rounded-full" style={{ background: statusColor(t.status) }} />
+                  </span>
+                  <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
+                  <span className="text-xs text-cp-muted w-28 truncate">{t.model || "N/A"}</span>
+                  <span className="text-xs font-mono text-cp-secondary w-20 text-right">{fmtMs(t.latency_ms)}</span>
+                  <span className="text-xs font-mono text-cp-muted w-16 text-right">{fmtCost(t.estimated_cost_usd)}</span>
+                  <span className="text-xs font-mono w-14 text-right" style={{
+                    color: t.factuality_score == null ? "#9e9e9b"
+                      : t.factuality_score >= 0.8 ? "#16a34a"
+                      : t.factuality_score >= 0.6 ? "#d97706" : "#dc2626"
+                  }}>
+                    {t.factuality_score != null ? `${(t.factuality_score * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <span className="text-xs text-cp-muted w-20 text-right">{fmtTime(t.created_at)}</span>
+                  <ArrowRight size={12} className="text-cp-muted w-4" />
+                </button>
+              ))}
+              {filtered.length === 0 && (
+                <div className="px-4 py-8 text-center text-xs text-cp-muted">No traces match.</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ANALYTICS */}
+        {tab === "analytics" && (
+          <div className="space-y-6">
+            <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+              <div className="text-sm font-medium text-cp-text mb-4">Latency Distribution</div>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={latencyData} barSize={32}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e4e4e2" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "#6b6b68" }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fontSize: 10, fill: "#6b6b68" }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={{ background: "#ffffff", border: "1px solid #e4e4e2", borderRadius: 4, fontSize: 11 }} />
+                  <Bar dataKey="count" name="Traces" fill="#2563eb" radius={[3, 3, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            {analytics?.models && analytics.models.length > 0 && (
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-sm font-medium text-cp-text mb-4">Model Breakdown</div>
+                <div className="space-y-3">
+                  {analytics.models.map(m => {
+                    const maxReqs = Math.max(...analytics.models.map(x => x.requests));
+                    return (
+                      <div key={m.model} className="flex items-center gap-3 text-xs">
+                        <span className="font-mono text-cp-text w-36 truncate">{m.model}</span>
+                        <div className="flex-1 h-1.5 bg-cp-elevated rounded-full">
+                          <div className="h-full rounded-full bg-cp-blue"
+                            style={{ width: `${(m.requests / maxReqs) * 100}%` }} />
+                        </div>
+                        <span className="text-cp-secondary w-14 text-right">{m.requests} req</span>
+                        <span className="text-cp-muted w-16 text-right">{fmtMs(m.average_latency_ms)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {analytics?.spans && analytics.spans.length > 0 && (
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-sm font-medium text-cp-text mb-4">Span Types</div>
+                <div className="space-y-2">
+                  {analytics.spans.map(s => {
+                    const maxCount = Math.max(...analytics.spans.map(x => x.count));
+                    return (
+                      <div key={s.span_type} className="flex items-center gap-3 text-xs">
+                        <span className="w-2 h-2 rounded-full flex-shrink-0"
+                          style={{ background: KIND_COLOR[s.span_type] || "#6e7a8a" }} />
+                        <span className="text-cp-text capitalize w-24">{s.span_type}</span>
+                        <div className="flex-1 h-1 bg-cp-elevated rounded-full">
+                          <div className="h-full rounded-full"
+                            style={{ width: `${(s.count / maxCount) * 100}%`, background: KIND_COLOR[s.span_type] || "#6e7a8a" }} />
+                        </div>
+                        <span className="text-cp-secondary w-10 text-right">{s.count}</span>
+                        <span className="text-cp-muted w-16 text-right">{fmtMs(s.average_duration_ms)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {!analytics && (
+              <div className="text-xs text-cp-muted text-center py-8">
+                Analytics unavailable — backend not connected.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* RELIABILITY */}
+        {tab === "reliability" && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-3 gap-4">
+              {[
+                { label: "Success Rate", value: `${app.reliability.toFixed(1)}%`,
+                  color: app.reliability >= 97 ? "#16a34a" : "#d97706" },
+                { label: "Error Traces", value: String(errorTraces.length),
+                  color: errorTraces.length > 0 ? "#dc2626" : "#16a34a" },
+                { label: "Blocked", value: String(app.traces.filter(t => t.status === "blocked").length),
+                  color: "#d97706" },
+              ].map(({ label, value, color }) => (
+                <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4 text-center">
+                  <div className="text-2xl font-bold font-mono" style={{ color }}>{value}</div>
+                  <div className="text-xs text-cp-muted mt-1">{label}</div>
+                </div>
+              ))}
+            </div>
+
+            {errorTraces.length > 0 && (
+              <div>
+                <div className="text-sm font-medium text-cp-text mb-3">Failed Traces</div>
+                <div className="bg-cp-surface border border-cp-border rounded-lg overflow-hidden">
+                  {errorTraces.map((t, i) => (
+                    <button key={t.id} onClick={() => onSelectTrace(t.id)}
+                      className={`w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+                      <XCircle size={12} className="text-cp-error flex-shrink-0" />
+                      <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
+                      <span className="text-xs text-cp-muted">{fmtTime(t.created_at)}</span>
+                      <span className="text-xs px-1.5 py-0.5 rounded capitalize"
+                        style={{ background: statusColor(t.status) + "22", color: statusColor(t.status) }}>
+                        {t.status}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {errorTraces.length === 0 && (
+              <div className="flex flex-col items-center py-16 text-cp-secondary">
+                <CheckCircle size={32} className="text-cp-success mb-3" />
+                <div className="text-sm">All traces succeeded</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* QUALITY */}
+        {tab === "quality" && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-xs text-cp-muted mb-1">Average Factuality</div>
+                <div className="text-3xl font-bold font-mono" style={{
+                  color: app.quality == null ? "#9e9e9b"
+                    : app.quality >= 90 ? "#16a34a" : app.quality >= 80 ? "#d97706" : "#dc2626"
+                }}>
+                  {app.quality != null ? `${app.quality.toFixed(0)}%` : "N/A"}
+                </div>
+              </div>
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-xs text-cp-muted mb-1">Evaluated Traces</div>
+                <div className="text-3xl font-bold font-mono text-cp-text">
+                  {app.shadowCounts.total - app.shadowCounts.pending} / {app.shadowCounts.total}
+                </div>
+              </div>
+            </div>
+
+            {qualityData.length > 0 && (
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-sm font-medium text-cp-text mb-4">Shadow Evaluation Distribution</div>
+                <div className="flex gap-8 items-center">
+                  <PieChart width={180} height={180}>
+                    <Pie data={qualityData} dataKey="value" cx="50%" cy="50%"
+                      innerRadius={50} outerRadius={75} paddingAngle={2}>
+                      {qualityData.map((entry, i) => <Cell key={`qd-${i}`} fill={entry.color} />)}
+                    </Pie>
+                  </PieChart>
+                  <div className="space-y-2">
+                    {qualityData.map(d => (
+                      <div key={d.name} className="flex items-center gap-2 text-xs">
+                        <span className="w-2 h-2 rounded-full" style={{ background: d.color }} />
+                        <span className="text-cp-secondary w-20">{d.name}</span>
+                        <span className="font-mono text-cp-text">{d.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+              <div className="text-sm font-medium text-cp-text mb-3">Detailed Quality Metrics</div>
+              {["Grounding", "Relevance", "Completeness", "Flow Accuracy", "Safety"].map(m => (
+                <div key={m} className="flex justify-between py-2 border-b border-cp-border/50 text-xs last:border-0">
+                  <span className="text-cp-secondary">{m}</span>
+                  <span className="text-cp-muted">N/A</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* COST */}
+        {tab === "cost" && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-3 gap-4">
+              {[
+                { label: "Total Cost", value: fmtCost(app.totalCost) },
+                { label: "Avg per Trace", value: app.traces.length > 0 ? fmtCost(app.totalCost / app.traces.length) : "N/A" },
+                { label: "Total Tokens", value: totalTokens > 0 ? totalTokens.toLocaleString() : "N/A" },
+              ].map(({ label, value }) => (
+                <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                  <div className="text-xs text-cp-muted mb-1">{label}</div>
+                  <div className="text-2xl font-bold font-mono text-cp-text">{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {analytics?.models && analytics.models.length > 0 && (
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-sm font-medium text-cp-text mb-4">Cost by Model</div>
+                <div className="space-y-3">
+                  {analytics.models.map(m => {
+                    const maxCost = Math.max(...analytics.models.map(x => x.total_cost_usd));
+                    return (
+                      <div key={m.model}>
+                        <div className="flex justify-between text-xs mb-1">
+                          <span className="font-mono text-cp-text">{m.model}</span>
+                          <span className="text-cp-secondary">{fmtCost(m.total_cost_usd)}</span>
+                        </div>
+                        <div className="h-1.5 bg-cp-elevated rounded-full">
+                          <div className="h-full rounded-full bg-amber-600"
+                            style={{ width: `${maxCost > 0 ? (m.total_cost_usd / maxCost) * 100 : 0}%` }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {analytics?.most_expensive_requests && analytics.most_expensive_requests.length > 0 && (
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
+                <div className="text-sm font-medium text-cp-text mb-3">Most Expensive Traces</div>
+                {analytics.most_expensive_requests.map((r, i) => (
+                  <button key={r.trace_id} onClick={() => onSelectTrace(r.trace_id)}
+                    className={`w-full flex items-center gap-4 py-2 text-left text-xs hover:text-cp-text text-cp-secondary transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+                    <span className="font-mono flex-1 truncate">{r.trace_id.slice(0, 16)}…</span>
+                    <span className="text-cp-text font-mono">{fmtCost(r.estimated_cost_usd)}</span>
+                    <span className="text-cp-muted">{(r.input_tokens + r.output_tokens).toLocaleString()} tokens</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* SAFETY */}
+        {tab === "safety" && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-3 gap-4">
+              {[
+                { label: "Safety Flags", value: String(app.safetyFlags),
+                  color: app.safetyFlags > 0 ? "#dc2626" : "#16a34a" },
+                { label: "Blocked", value: String(app.traces.filter(t => t.status === "blocked").length),
+                  color: "#d97706" },
+                { label: "Safe Rate", value: `${((1 - app.safetyFlags / Math.max(1, app.traces.length)) * 100).toFixed(1)}%`,
+                  color: "#16a34a" },
+              ].map(({ label, value, color }) => (
+                <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4 text-center">
+                  <div className="text-3xl font-bold font-mono" style={{ color }}>{value}</div>
+                  <div className="text-xs text-cp-muted mt-1">{label}</div>
+                </div>
+              ))}
+            </div>
+
+            {safetyTraces.length > 0 ? (
+              <div>
+                <div className="text-sm font-medium text-cp-text mb-3">Flagged Traces</div>
+                <div className="bg-cp-surface border border-cp-border rounded-lg overflow-hidden">
+                  {safetyTraces.map((t, i) => (
+                    <button key={t.id} onClick={() => onSelectTrace(t.id)}
+                      className={`w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+                      <Shield size={12} className="text-cp-error flex-shrink-0" />
+                      <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
+                      <span className="text-xs text-cp-muted">{t.safety_type || "N/A"}</span>
+                      <span className="text-xs text-cp-muted">{t.safety_action || "N/A"}</span>
+                      <span className="text-xs text-cp-muted">{fmtTime(t.created_at)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center py-16 text-cp-secondary">
+                <Shield size={32} className="text-cp-success mb-3" />
+                <div className="text-sm">No safety violations detected</div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Applications Home ────────────────────────────────────────────────────────
+
+function ApplicationsHome({ onSelectApp }: { onSelectApp: (app: AppGroup) => void }) {
+  const [traces, setTraces] = useState<ApiTrace[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<"all" | "healthy" | "warning" | "critical">("all");
+  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    apiGet<ApiTrace[]>("/traces?limit=500")
+      .then(setTraces)
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const apps = groupTracesBySession(traces);
+  const filtered = apps.filter(a => {
+    if (filter !== "all" && a.health !== filter) return false;
+    if (search && !a.name.toLowerCase().includes(search.toLowerCase()) &&
+        !a.sessionId.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  const counts = {
+    healthy: apps.filter(a => a.health === "healthy").length,
+    warning: apps.filter(a => a.health === "warning").length,
+    critical: apps.filter(a => a.health === "critical").length,
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-cp-app">
+      {/* Top nav */}
+      <div className="flex items-center gap-4 px-6 h-14 border-b border-cp-border flex-shrink-0 bg-cp-surface">
+        <div className="flex items-center gap-2">
+          <div className="w-6 h-6 rounded bg-cp-purple flex items-center justify-center">
+            <Command size={12} className="text-white" />
+          </div>
+          <span className="text-sm font-bold text-cp-text tracking-tight">ControlPlane.AI</span>
+        </div>
+        <div className="flex-1" />
+        <div className="flex items-center gap-2">
+          <button onClick={load}
+            className="flex items-center gap-1.5 text-xs text-cp-secondary hover:text-cp-text px-2 py-1.5 rounded border border-cp-border hover:border-cp-border-strong transition-colors">
+            <RefreshCw size={12} /> Refresh
+          </button>
+          <button className="p-1.5 rounded border border-cp-border text-cp-secondary hover:text-cp-text transition-colors">
+            <Settings size={14} />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-6">
+        {/* Page header */}
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-xl font-bold text-cp-text">Applications</h1>
+            <p className="text-xs text-cp-secondary mt-0.5">
+              AI application observability and control plane
+            </p>
+          </div>
+          <button className="flex items-center gap-1.5 text-xs bg-cp-purple text-white px-3 py-2 rounded hover:bg-cp-purple/90 transition-colors">
+            <Plus size={12} /> Add Application
+          </button>
+        </div>
+
+        {/* Status summary */}
+        {!loading && !error && apps.length > 0 && (
+          <div className="flex gap-4 mb-6">
+            {[
+              { label: "Healthy", count: counts.healthy, color: "#16a34a" },
+              { label: "Warning", count: counts.warning, color: "#d97706" },
+              { label: "Critical", count: counts.critical, color: "#dc2626" },
+            ].map(({ label, count, color }) => (
+              <div key={label} className="flex items-center gap-2 text-xs">
+                <span className="w-2 h-2 rounded-full" style={{ background: color }} />
+                <span className="text-cp-secondary">{label}</span>
+                <span className="font-mono text-cp-text">{count}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Controls */}
+        <div className="flex items-center gap-3 mb-6">
+          <div className="relative flex-1 max-w-xs">
+            <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-cp-muted" />
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search applications…"
+              className="w-full bg-cp-elevated border border-cp-border rounded pl-8 pr-3 py-2 text-xs text-cp-text placeholder-cp-muted outline-none focus:border-cp-border-strong" />
+          </div>
+
+          <div className="flex gap-0.5 bg-cp-elevated border border-cp-border rounded p-0.5">
+            {(["all", "healthy", "warning", "critical"] as const).map(f => (
+              <button key={f} onClick={() => setFilter(f)}
+                className={`px-2.5 py-1 text-xs rounded capitalize transition-colors ${
+                  filter === f ? "bg-cp-active text-cp-text" : "text-cp-secondary hover:text-cp-text"
+                }`}>
+                {f}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex gap-0.5 bg-cp-elevated border border-cp-border rounded p-0.5 ml-auto">
+            <button onClick={() => setViewMode("grid")}
+              className={`p-1.5 rounded transition-colors ${viewMode === "grid" ? "bg-cp-active text-cp-text" : "text-cp-muted hover:text-cp-secondary"}`}>
+              <Grid3x3 size={13} />
+            </button>
+            <button onClick={() => setViewMode("list")}
+              className={`p-1.5 rounded transition-colors ${viewMode === "list" ? "bg-cp-active text-cp-text" : "text-cp-muted hover:text-cp-secondary"}`}>
+              <LayoutList size={13} />
+            </button>
+          </div>
+        </div>
+
+        {/* Loading */}
+        {loading && (
+          <div className="flex items-center justify-center py-24 text-cp-secondary text-sm gap-2">
+            <Loader2 size={18} className="animate-spin" /> Connecting to backend…
+          </div>
+        )}
+
+        {/* Error */}
+        {!loading && error && (
+          <div className="flex flex-col items-center justify-center py-24">
+            <AlertCircle size={32} className="text-cp-error mb-4" />
+            <div className="text-sm font-medium text-cp-text mb-1">Cannot connect to backend</div>
+            <div className="text-xs text-cp-secondary mb-4 max-w-sm text-center">
+              Ensure the ControlPlane.AI API is running at <span className="font-mono text-cp-text">{API_BASE}</span>
+            </div>
+            <code className="text-xs text-cp-error bg-cp-elevated border border-cp-border rounded px-3 py-2">
+              {error}
+            </code>
+            <button onClick={load}
+              className="mt-4 text-xs text-cp-blue hover:underline flex items-center gap-1">
+              <RefreshCw size={11} /> Try again
+            </button>
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!loading && !error && apps.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-24 text-cp-secondary text-sm">
+            <BarChart2 size={32} className="mb-3 text-cp-muted" />
+            No traces found. Send your first trace to get started.
+          </div>
+        )}
+
+        {/* Applications grid / list */}
+        {!loading && !error && filtered.length > 0 && (
+          viewMode === "grid" ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {filtered.map(app => (
+                <AppCard key={app.sessionId} app={app} onClick={() => onSelectApp(app)} />
+              ))}
+            </div>
+          ) : (
+            <AppListView apps={filtered} onSelect={onSelectApp} />
+          )
+        )}
+
+        {!loading && !error && apps.length > 0 && filtered.length === 0 && (
+          <div className="text-center py-16 text-xs text-cp-muted">
+            No applications match your filters.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AppCard({ app, onClick }: { app: AppGroup; onClick: () => void }) {
+  const hc = healthColor(app.health);
+
+  return (
+    <button onClick={onClick}
+      className="bg-cp-surface border border-cp-border rounded-lg p-5 text-left hover:bg-cp-hover hover:border-cp-border-strong transition-all group text-left w-full">
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-cp-text truncate">
+            {app.name}
+          </div>
+          <div className="text-xs text-cp-muted font-mono truncate mt-0.5">{app.sessionId}</div>
+        </div>
+        <div className="flex items-center gap-1.5 ml-3 flex-shrink-0">
+          <span className="w-2 h-2 rounded-full" style={{ background: hc }} />
+          <span className="text-xs font-medium capitalize" style={{ color: hc }}>{app.health}</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 mb-4">
+        {[
+          { label: "Reliability", value: `${app.reliability.toFixed(1)}%`,
+            color: app.reliability >= 97 ? "#16a34a" : app.reliability >= 90 ? "#d97706" : "#dc2626" },
+          { label: "Quality", value: app.quality != null ? `${app.quality.toFixed(0)}%` : "N/A",
+            color: app.quality == null ? "#6b6b68" : app.quality >= 90 ? "#16a34a" : app.quality >= 80 ? "#d97706" : "#dc2626" },
+          { label: "P95 Latency", value: fmtMs(app.p95Latency), color: undefined },
+          { label: "Traces", value: app.traces.length.toLocaleString(), color: undefined },
+        ].map(({ label, value, color }) => (
+          <div key={label}>
+            <div className="text-xs text-cp-muted">{label}</div>
+            <div className="text-sm font-mono font-medium" style={{ color: color || "#1a1a18" }}>
+              {value}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex items-center justify-between border-t border-cp-border pt-3">
+        <span className="text-xs text-cp-muted">{fmtTime(app.lastActivity)}</span>
+        <span className="text-xs text-cp-purple flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          Open <ArrowRight size={11} />
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function AppListView({ apps, onSelect }: { apps: AppGroup[]; onSelect: (a: AppGroup) => void }) {
+  return (
+    <div className="bg-cp-surface border border-cp-border rounded-lg overflow-hidden">
+      <div className="flex items-center gap-4 px-4 py-2 border-b border-cp-border text-xs text-cp-muted">
+        <span className="flex-1">Application</span>
+        <span className="w-24 text-right">Reliability</span>
+        <span className="w-20 text-right">Quality</span>
+        <span className="w-24 text-right">P95</span>
+        <span className="w-16 text-right">Traces</span>
+        <span className="w-20 text-right">Flags</span>
+        <span className="w-24 text-right">Last Active</span>
+        <span className="w-4" />
+      </div>
+      {apps.map((app, i) => {
+        const hc = healthColor(app.health);
+        return (
+          <button key={app.sessionId} onClick={() => onSelect(app)}
+            className={`w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: hc }} />
+              <span className="text-sm text-cp-text font-medium truncate">{app.name}</span>
+            </div>
+            <span className="text-xs font-mono w-24 text-right" style={{
+              color: app.reliability >= 97 ? "#16a34a" : app.reliability >= 90 ? "#d97706" : "#dc2626"
+            }}>
+              {app.reliability.toFixed(1)}%
+            </span>
+            <span className="text-xs font-mono w-20 text-right" style={{
+              color: app.quality == null ? "#9e9e9b" : app.quality >= 90 ? "#16a34a" : app.quality >= 80 ? "#d97706" : "#dc2626"
+            }}>
+              {app.quality != null ? `${app.quality.toFixed(0)}%` : "N/A"}
+            </span>
+            <span className="text-xs font-mono text-cp-secondary w-24 text-right">{fmtMs(app.p95Latency)}</span>
+            <span className="text-xs text-cp-secondary w-16 text-right">{app.traces.length.toLocaleString()}</span>
+            <span className="text-xs w-20 text-right"
+              style={{ color: app.safetyFlags > 0 ? "#dc2626" : "#9e9e9b" }}>
+              {app.safetyFlags > 0 ? `${app.safetyFlags} flagged` : "—"}
+            </span>
+            <span className="text-xs text-cp-muted w-24 text-right">{fmtTime(app.lastActivity)}</span>
+            <ArrowRight size={12} className="text-cp-muted w-4" />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Root App ─────────────────────────────────────────────────────────────────
+
+export default function App(): React.JSX.Element {
+  const [screen, setScreen] = useState<Screen>("home");
+  const [selectedApp, setSelectedApp] = useState<AppGroup | null>(null);
+  const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+
+  const handleSelectApp = (app: AppGroup) => {
+    setSelectedApp(app);
+    setScreen("app");
+  };
+
+  const handleSelectTrace = (traceId: string) => {
+    setSelectedTraceId(traceId);
+    setScreen("trace");
+  };
+
+  if (screen === "trace" && selectedTraceId && selectedApp) {
+    return (
+      <TraceInvestigation
+        traceId={selectedTraceId}
+        sessionTraces={selectedApp.traces}
+        onSelectTrace={handleSelectTrace}
+        onBack={() => { setSelectedTraceId(null); setScreen("app"); }}
+      />
+    );
+  }
+
+  if (screen === "app" && selectedApp) {
+    return (
+      <ApplicationWorkspace
+        app={selectedApp}
+        onBack={() => { setSelectedApp(null); setScreen("home"); }}
+        onSelectTrace={handleSelectTrace}
+      />
+    );
+  }
+
+  return <ApplicationsHome onSelectApp={handleSelectApp} />;
+}

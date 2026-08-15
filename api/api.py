@@ -2,12 +2,18 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 from uuid import UUID
-
+from fastapi.middleware.cors import CORSMiddleware
 from .database import get_connection
 
 
 app = FastAPI(title="ControlPlane.AI")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def validate_uuid(
     value: str,

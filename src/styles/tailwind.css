@@ -1,0 +1,54 @@
+@import 'tailwindcss' source(none);
+@source '../**/*.{js,ts,jsx,tsx}';
+@import 'tw-animate-css';
+
+@theme {
+  --font-sans: 'Geist', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', 'Courier New', monospace;
+
+  /* App surfaces — clean light, warm white */
+  --color-cp-app:      #ffffff;
+  --color-cp-surface:  #f9f9f8;
+  --color-cp-elevated: #f3f3f1;
+  --color-cp-hover:    #f3f3f1;
+  --color-cp-active:   #ebebea;
+
+  /* Canvas — dark inset area */
+  --color-cp-canvas:   #1e1d1b;
+
+  /* Borders */
+  --color-cp-border:        #e8e8e6;
+  --color-cp-border-strong: #d4d4d2;
+
+  /* Text */
+  --color-cp-text:       #1a1a18;
+  --color-cp-secondary:  #6b6b68;
+  --color-cp-muted:      #9e9e9b;
+
+  /* Brand — orange accent */
+  --color-cp-purple: #f97316;
+  --color-cp-blue:   #ea580c;
+
+  /* Semantic */
+  --color-cp-success: #16a34a;
+  --color-cp-warning: #d97706;
+  --color-cp-error:   #dc2626;
+  --color-cp-running: #2563eb;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar        { width: 4px; height: 4px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: #d0d0ce; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #b8b8b6; }
+
+/* Selection */
+::selection { background: #f9731625; color: #1a1a18; }
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #ffffff;
+  color: #1a1a18;
+  font-family: 'Geist', system-ui, sans-serif;
+}
