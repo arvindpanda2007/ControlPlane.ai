@@ -203,6 +203,10 @@ interface WFNode {
   input?: string | null;
   output?: string | null;
   context?: string | null;
+  // Persisted span ID backing this visual graph node. Graph node IDs can be
+  // generated independently by the backend, so the inspector uses this ID
+  // to retrieve the exact per-step input/output.
+  sourceSpanId?: string;
 }
 
 interface WFEdge { from: string; to: string; }
@@ -254,6 +258,51 @@ function flattenSpans(spans: ApiSpan[]): ApiSpan[] {
   }
   spans.forEach(walk);
   return flat;
+}
+
+function resolveSpanForGraphNode(
+  graphNode: ApiGraphNode,
+  flatSpans: ApiSpan[],
+): ApiSpan | undefined {
+  // 1. Exact ID is the safest mapping.
+  const exact = flatSpans.find(s => s.id === graphNode.id);
+  if (exact) return exact;
+
+  // 2. Some graph builders keep the originating span ID in metadata.
+  const meta = graphNode.metadata || {};
+  const possibleIds = [
+    meta.span_id,
+    meta.spanId,
+    meta.source_span_id,
+    meta.sourceSpanId,
+    meta.id,
+  ].filter((v): v is string => typeof v === "string");
+
+  for (const id of possibleIds) {
+    const match = flatSpans.find(s => s.id === id);
+    if (match) return match;
+  }
+
+  // 3. Match by name + start time. This is important when a workflow has
+  // repeated node names: name-only matching can attach every node to the
+  // first span with that name.
+  const sameName = flatSpans.filter(s => s.name === graphNode.name);
+  if (sameName.length === 0) return undefined;
+  if (sameName.length === 1) return sameName[0];
+
+  const graphTime = graphNode.started_at
+    ? new Date(graphNode.started_at).getTime()
+    : null;
+
+  if (graphTime != null && Number.isFinite(graphTime)) {
+    return [...sameName].sort((a, b) => {
+      const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      const bt = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      return Math.abs(at - graphTime) - Math.abs(bt - graphTime);
+    })[0];
+  }
+
+  return sameName[0];
 }
 
 function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: WFEdge[] } {
@@ -448,7 +497,7 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
     const rowOffset = -totalW / 2;
 
     ids.forEach((graphNode, i) => {
-      const span = spanMap.get(graphNode.id);
+      const span = resolveSpanForGraphNode(graphNode, flatSpans);
       const meta = (graphNode.metadata || span?.metadata || {}) as Record<string, unknown>;
       const spanType = graphNode.span_type || span?.span_type || "tool";
       const kind = (KIND_COLOR[spanType] !== undefined ? spanType : "tool") as NodeKind;
@@ -472,6 +521,7 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
         input: graphNode.input ?? span?.input ?? (meta.input as string | null | undefined) ?? null,
         output: graphNode.output ?? span?.output ?? (meta.output as string | null | undefined) ?? null,
         context: graphNode.context ?? span?.context ?? (meta.context as string | null | undefined) ?? null,
+        sourceSpanId: span?.id,
         childCount: childCount > 0 ? childCount : undefined,
       });
     });
@@ -997,11 +1047,14 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
   // so the inspector still resolves the actual span payload.
   const span = node
     ? (
+        // The layout stores the exact persisted span behind this visual node.
+        (node.sourceSpanId
+          ? flatSpans.find(s => s.id === node.sourceSpanId)
+          : undefined) ??
+        // Exact graph/span ID remains a valid fallback.
         flatSpans.find(s => s.id === node.id) ??
-        flatSpans.find(s =>
-          s.name === node.name &&
-          (node.id === s.id || !s.parent_span_id)
-        )
+        // Last fallback for older traces without sourceSpanId.
+        flatSpans.find(s => s.name === node.name)
       )
     : null;
 
@@ -1105,19 +1158,12 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
    * - Child node: only use that child span's input/context/output (or its
    *   metadata). Never substitute the root trace payload.
    */
-  const realInput = isRootNode
-    ? (
-        toDisplayValue(trace?.input) ??
-        toDisplayValue(span?.input) ??
-        toDisplayValue(metadataInput) ??
-        toDisplayValue(node.input) ??
-        toDisplayValue(shadowEval?.input)
-      )
-    : (
-        toDisplayValue(span?.input) ??
-        toDisplayValue(metadataInput) ??
-        toDisplayValue(node.input)
-      );
+  const realInput =
+    toDisplayValue(span?.input) ??
+    toDisplayValue(node.input) ??
+    toDisplayValue(metadataInput) ??
+    (isRootNode ? toDisplayValue(trace?.input) : null) ??
+    (isRootNode ? toDisplayValue(shadowEval?.input) : null);
 
   const realContext = isRootNode
     ? (
@@ -1133,50 +1179,27 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
         toDisplayValue(node.context)
       );
 
-  const realOutput = isRootNode
-    ? (
-        toDisplayValue(trace?.output) ??
-        toDisplayValue(span?.output) ??
-        toDisplayValue(metadataOutput) ??
-        toDisplayValue(node.output)
-      )
-    : (
-        toDisplayValue(span?.output) ??
-        toDisplayValue(metadataOutput) ??
-        toDisplayValue(node.output)
-      );
+  const realOutput =
+    toDisplayValue(span?.output) ??
+    toDisplayValue(node.output) ??
+    toDisplayValue(metadataOutput) ??
+    (isRootNode ? toDisplayValue(trace?.output) : null);
 
-  const inputSource = isRootNode
-    ? (
-        trace?.input != null ? "trace / prompt" :
-        span?.input != null ? "span" :
-        metadataInput != null ? "metadata" :
-        node.input != null ? "graph node" :
-        shadowEval?.input != null ? "shadow prompt" :
-        null
-      )
-    : (
-        span?.input != null ? "span" :
-        metadataInput != null ? "metadata" :
-        node.input != null ? "graph node" :
-        null
-      );
+  const inputSource =
+    span?.input != null ? "span" :
+    node.input != null ? "graph node" :
+    metadataInput != null ? "metadata" :
+    isRootNode && trace?.input != null ? "trace / prompt" :
+    isRootNode && shadowEval?.input != null ? "shadow prompt" :
+    null;
 
-  const contextSource = isRootNode
-    ? (
-        trace?.context != null ? "trace" :
-        span?.context != null ? "span" :
-        metadataContext != null ? "metadata" :
-        node.context != null ? "graph node" :
-        shadowEval?.context != null ? "shadow" :
-        null
-      )
-    : (
-        span?.context != null ? "span" :
-        metadataContext != null ? "metadata" :
-        node.context != null ? "graph node" :
-        null
-      );
+  const contextSource =
+    span?.context != null ? "span" :
+    node.context != null ? "graph node" :
+    metadataContext != null ? "metadata" :
+    isRootNode && trace?.context != null ? "trace" :
+    isRootNode && shadowEval?.context != null ? "shadow" :
+    null;
 
   return (
     <div className="flex flex-col h-full">
@@ -1727,39 +1750,32 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
     Promise.all([
       apiGet<ApiTraceDetail>(`/traces/${traceId}`),
       apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
-      // /spans/{trace_id} is the canonical per-span I/O payload.
-      apiGet<ApiSpan[]>(`/spans/${traceId}`).catch(() => []),
-    ]).then(([d, ins, persistedSpans]) => {
-      // Some backend versions return the span tree correctly but omit
-      // input/output from the graph/detail representation. Enrich it from
-      // the flat spans endpoint before the graph is built.
-      const ioById = new Map(
-        persistedSpans.map(span => [
-          span.id,
-          {
-            input: span.input ?? null,
-            output: span.output ?? null,
-            context: span.context ?? null,
-          },
-        ])
-      );
+    ]).then(([d, ins]) => {
+      // The trace endpoint is the source of truth for per-span input/output.
+      // Enrich graph nodes before layout so clicking a graph node always has
+      // the same payload as the corresponding persisted span.
+      const persisted = flattenSpans(d.spans || []);
 
-      const enrichSpan = (span: ApiSpan): ApiSpan => {
-        const io = ioById.get(span.id);
-        return {
-          ...span,
-          input: span.input ?? io?.input ?? null,
-          output: span.output ?? io?.output ?? null,
-          context: span.context ?? io?.context ?? null,
-          children: span.children?.map(enrichSpan),
-        };
-      };
+      const enrichedGraph = d.graph
+        ? {
+            ...d.graph,
+            nodes: (d.graph.nodes || []).map(g => {
+              const span = resolveSpanForGraphNode(g, persisted);
 
-      const enrichedSpans = (d.spans || []).map(enrichSpan);
+              return {
+                ...g,
+                input: g.input ?? span?.input ?? null,
+                output: g.output ?? span?.output ?? null,
+                context: g.context ?? span?.context ?? null,
+                parent_span_id: g.parent_span_id ?? span?.parent_span_id ?? null,
+              };
+            }),
+          }
+        : d.graph;
 
       setDetail({
         ...d,
-        spans: enrichedSpans,
+        graph: enrichedGraph,
       });
       setInsights(ins);
     }).catch(err => setError(err.message))
