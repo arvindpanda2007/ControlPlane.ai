@@ -200,6 +200,9 @@ interface WFNode {
   outputTokens?: number;
   cost?: number;
   childCount?: number;
+  input?: string | null;
+  output?: string | null;
+  context?: string | null;
 }
 
 interface WFEdge { from: string; to: string; }
@@ -284,6 +287,7 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
   const nodeMap = new Map(sourceNodes.map(n => [n.id, n]));
   const childrenOf = new Map<string, string[]>();
   const parentsOf = new Map<string, string[]>();
+
   sourceNodes.forEach(n => {
     childrenOf.set(n.id, []);
     parentsOf.set(n.id, []);
@@ -291,6 +295,7 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
 
   const graphEdges: WFEdge[] = [];
   const edgeKeys = new Set<string>();
+
   const addEdge = (from: string, to: string) => {
     if (!nodeMap.has(from) || !nodeMap.has(to) || from === to) return;
     const key = `${from}->${to}`;
@@ -301,8 +306,10 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
     parentsOf.get(to)!.push(from);
   };
 
-  // Use explicit topology first, then real parent_span_id relationships.
+  // Preserve the backend's real topology whenever it is available.
   for (const e of (backendEdges || [])) addEdge(e.source, e.target);
+
+  // Some traces expose topology only through parent_span_id.
   if (!graphEdges.length) {
     for (const n of sourceNodes) {
       if (n.parent_span_id && nodeMap.has(n.parent_span_id)) {
@@ -311,10 +318,7 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
     }
   }
 
-  // IMPORTANT: the graph is rendered TOP -> BOTTOM. If the telemetry contains
-  // no usable incoming relationships, treat the recorded span sequence as a
-  // workflow chain. This fixes traces where Agent + LLM arrive as two roots.
-  // We only use this fallback when there is no usable topology at all.
+  // Last-resort chain reconstruction for old telemetry that has no relationships.
   if (!graphEdges.length && sourceNodes.length > 1) {
     const ordered = [...sourceNodes].sort((a, b) => {
       const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
@@ -324,71 +328,125 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
     for (let i = 1; i < ordered.length; i++) addEdge(ordered[i - 1].id, ordered[i].id);
   }
 
-  // If there are multiple roots but the backend supplied incomplete topology,
-  // connect orphan roots in execution order. Existing branch/merge edges stay
-  // untouched, so complex DAGs still render correctly.
-  if (graphEdges.length && sourceNodes.length > 1) {
-    const incoming = new Set(graphEdges.map(e => e.to));
-    const roots = sourceNodes
-      .filter(n => !incoming.has(n.id))
-      .sort((a, b) => {
-        const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
-        const bt = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
-        return at - bt;
-      });
-
-    // Only repair roots that look like later execution stages. Keep the first
-    // root as the true entry point and connect subsequent roots vertically.
-    if (roots.length > 1) {
-      for (let i = 1; i < roots.length; i++) addEdge(roots[i - 1].id, roots[i].id);
-    }
-  }
-
-  // Longest-path layering: every edge points downward. A merge node is placed
-  // below all of its parents, while sibling branches share the same Y level.
+  /*
+   * Layered DAG layout.
+   *
+   * Unlike the old "index within level" layout, this:
+   *  - keeps every branch on its own lane;
+   *  - keeps merge nodes below ALL of their parents;
+   *  - orders siblings by the barycenter of their parents/children to reduce
+   *    edge crossings;
+   *  - handles disconnected roots;
+   *  - does not throw away edges when telemetry contains a cycle.
+   */
   const indegree = new Map<string, number>();
-  const levelOf = new Map<string, number>();
-  const queue: string[] = [];
   sourceNodes.forEach(n => indegree.set(n.id, parentsOf.get(n.id)!.length));
+
+  const rank = new Map<string, number>();
+  const queue: string[] = [];
+
   sourceNodes.forEach(n => {
     if ((indegree.get(n.id) || 0) === 0) {
-      levelOf.set(n.id, 0);
+      rank.set(n.id, 0);
       queue.push(n.id);
     }
   });
 
+  // Normal DAG ranking.
   let head = 0;
   while (head < queue.length) {
     const id = queue[head++];
-    const next = (levelOf.get(id) || 0) + 1;
+    const nextRank = (rank.get(id) || 0) + 1;
     for (const child of childrenOf.get(id) || []) {
-      levelOf.set(child, Math.max(levelOf.get(child) ?? 0, next));
-      indegree.set(child, (indegree.get(child) || 0) - 1);
-      if (indegree.get(child) === 0) queue.push(child);
+      rank.set(child, Math.max(rank.get(child) ?? 0, nextRank));
+      const nextIn = (indegree.get(child) || 0) - 1;
+      indegree.set(child, nextIn);
+      if (nextIn === 0) queue.push(child);
     }
   }
 
-  let maxLevel = Math.max(0, ...levelOf.values());
-  sourceNodes.forEach(n => {
-    if (!levelOf.has(n.id)) levelOf.set(n.id, ++maxLevel);
-  });
-
-  const byLevel = new Map<number, ApiGraphNode[]>();
-  for (const n of sourceNodes) {
-    const level = levelOf.get(n.id) ?? 0;
-    if (!byLevel.has(level)) byLevel.set(level, []);
-    byLevel.get(level)!.push(n);
+  // Cycle/disconnected fallback: assign unresolved nodes to a stable rank
+  // rather than allowing NaN/overlapping coordinates.
+  let maxRank = Math.max(0, ...rank.values());
+  const unresolved = sourceNodes.filter(n => !rank.has(n.id));
+  for (const n of unresolved) {
+    const parentRanks = (parentsOf.get(n.id) || [])
+      .map(id => rank.get(id))
+      .filter((v): v is number => v != null);
+    rank.set(n.id, parentRanks.length ? Math.max(...parentRanks) + 1 : 0);
+    maxRank = Math.max(maxRank, rank.get(n.id)!);
   }
 
-  // Vertical is the primary direction: Y is always the workflow stage.
-  // X only separates true sibling branches so they never overlap.
-  const HGAP = 70;
-  const VGAP = 90;
+  const levels = new Map<number, ApiGraphNode[]>();
+  for (const n of sourceNodes) {
+    const r = rank.get(n.id) ?? 0;
+    if (!levels.has(r)) levels.set(r, []);
+    levels.get(r)!.push(n);
+  }
+
+  // Stable initial ordering.
+  for (const ids of levels.values()) {
+    ids.sort((a, b) => {
+      const at = a.started_at ? new Date(a.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      const bt = b.started_at ? new Date(b.started_at).getTime() : Number.MAX_SAFE_INTEGER;
+      return at - bt || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+    });
+  }
+
+  // Crossing reduction. A few downward/upward barycenter sweeps make
+  // fan-outs and fan-ins much easier to follow without a graph library.
+  const position = new Map<string, number>();
+  const refreshPositions = () => {
+    for (const ids of levels.values()) ids.forEach((n, i) => position.set(n.id, i));
+  };
+
+  const barycenter = (id: string, neighbors: string[]) => {
+    const values = neighbors
+      .map(n => position.get(n))
+      .filter((v): v is number => v != null);
+    if (!values.length) return Number.POSITIVE_INFINITY;
+    return values.reduce((a, b) => a + b, 0) / values.length;
+  };
+
+  for (let sweep = 0; sweep < 4; sweep++) {
+    refreshPositions();
+
+    const ranks = [...levels.keys()].sort((a, b) => a - b);
+    for (let i = 1; i < ranks.length; i++) {
+      const ids = levels.get(ranks[i])!;
+      ids.sort((a, b) =>
+        barycenter(a.id, parentsOf.get(a.id) || []) -
+        barycenter(b.id, parentsOf.get(b.id) || [])
+      );
+      refreshPositions();
+    }
+
+    for (let i = ranks.length - 2; i >= 0; i--) {
+      const ids = levels.get(ranks[i])!;
+      ids.sort((a, b) =>
+        barycenter(a.id, childrenOf.get(a.id) || []) -
+        barycenter(b.id, childrenOf.get(b.id) || [])
+      );
+      refreshPositions();
+    }
+  }
+
+  const HGAP = 82;
+  const VGAP = 105;
+  const componentGap = 90;
   const nodes: WFNode[] = [];
 
-  [...byLevel.keys()].sort((a, b) => a - b).forEach(level => {
-    const ids = byLevel.get(level)!;
+  /*
+   * Keep the workflow vertical. Each rank gets a centered row. Wide branch
+   * levels are allowed to grow horizontally rather than crushing nodes into
+   * each other. This is intentionally deterministic so the same trace always
+   * looks the same.
+   */
+  [...levels.keys()].sort((a, b) => a - b).forEach(level => {
+    const ids = levels.get(level)!;
     const totalW = ids.length * NODE_W + Math.max(0, ids.length - 1) * HGAP;
+    const rowOffset = -totalW / 2;
+
     ids.forEach((graphNode, i) => {
       const span = spanMap.get(graphNode.id);
       const meta = (graphNode.metadata || span?.metadata || {}) as Record<string, unknown>;
@@ -405,12 +463,15 @@ function layoutGraph(detail: ApiTraceDetail | null): { nodes: WFNode[]; edges: W
           .includes(graphNode.status || span?.status || 'success')
           ? (graphNode.status || span?.status || 'success')
           : 'success') as RunStatus,
-        x: -totalW / 2 + i * (NODE_W + HGAP),
-        y: level * (NODE_H + VGAP),
+        x: rowOffset + i * (NODE_W + HGAP),
+        y: level * (NODE_H + VGAP + componentGap),
         model: meta.model as string | undefined,
         inputTokens: meta.input_tokens as number | undefined,
         outputTokens: meta.output_tokens as number | undefined,
         cost: (meta.cost as number | undefined) ?? (meta.estimated_cost_usd as number | undefined),
+        input: graphNode.input ?? span?.input ?? (meta.input as string | null | undefined) ?? null,
+        output: graphNode.output ?? span?.output ?? (meta.output as string | null | undefined) ?? null,
+        context: graphNode.context ?? span?.context ?? (meta.context as string | null | undefined) ?? null,
         childCount: childCount > 0 ? childCount : undefined,
       });
     });
@@ -719,21 +780,30 @@ function WorkflowCanvas({ nodes, edges, selectedNodeId, highlightedNodeId, onSel
             const to = visibleNodes.find(n => n.id === e.to);
             if (!from || !to) return null;
 
-            // Every edge leaves the bottom-center of the parent and enters the
-            // top-center of the child. This keeps the workflow visually
-            // top-to-bottom even when the graph branches or merges.
             const x1 = from.x + NODE_W / 2;
             const y1 = from.y + NODE_H;
             const x2 = to.x + NODE_W / 2;
             const y2 = to.y;
-            const distance = Math.max(30, y2 - y1);
-            const curve = Math.min(60, distance / 2);
             const isActive = selectedNodeId === e.from || selectedNodeId === e.to;
+
+            // Normal workflow edge: smooth vertical routing.
+            // Back-edges (possible in cyclic telemetry) get a side loop instead
+            // of producing an inverted arrow through the middle of the graph.
+            const d = y2 > y1
+              ? (() => {
+                  const distance = Math.max(30, y2 - y1);
+                  const curve = Math.min(70, distance / 2);
+                  return `M ${x1} ${y1} C ${x1} ${y1 + curve}, ${x2} ${y2 - curve}, ${x2} ${y2}`;
+                })()
+              : (() => {
+                  const side = Math.max(x1, x2) + 90;
+                  return `M ${x1} ${y1} C ${side} ${y1}, ${side} ${y2}, ${x2} ${y2}`;
+                })();
 
             return (
               <path
                 key={`${e.from}-${e.to}`}
-                d={`M ${x1} ${y1} C ${x1} ${y1 + curve}, ${x2} ${y2 - curve}, ${x2} ${y2}`}
+                d={d}
                 fill="none"
                 stroke={isActive ? "#f97316" : "#52504d"}
                 strokeWidth={isActive ? 2.5 : 2}
@@ -918,25 +988,39 @@ interface InspectorProps {
 
 function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: InspectorProps) {
   const [tab, setTab] = useState("overview");
-  // Lazily fetched output from the Shadow child trace.
+  // Shadow output is only a fallback for the ROOT workflow node.
+  // Never use one trace's Shadow result as the output of an arbitrary child node.
   const [childOutput, setChildOutput] = useState<string | null | "loading" | "error">(null);
 
-  const span = node ? flatSpans.find(s => s.id === node.id) : null;
+  // Graph nodes and spans normally share the same id. If a backend graph
+  // implementation only supplies graph nodes, fall back to name/parent matching
+  // so the inspector still resolves the actual span payload.
+  const span = node
+    ? (
+        flatSpans.find(s => s.id === node.id) ??
+        flatSpans.find(s =>
+          s.name === node.name &&
+          (node.id === s.id || !s.parent_span_id)
+        )
+      )
+    : null;
 
-  // Shadow evaluation record most relevant to this node (typically just one per trace).
+  const isRootNode = !span?.parent_span_id;
+
+  // Shadow evaluation record for the trace. It is deliberately scoped to the
+  // root node only; child nodes must display their own recorded output.
   const shadowEval = insights?.shadow_evaluations?.[0] ?? null;
 
-  // When user clicks "output" tab, fetch the child trace to get the actual LLM output.
   useEffect(() => {
-    if (tab !== "output" || !shadowEval?.trace_id) return;
-    if (childOutput !== null) return; // already fetched or loading
+    if (!isRootNode || tab !== "output" || !shadowEval?.trace_id) return;
+    if (childOutput !== null) return;
     setChildOutput("loading");
     apiGet<{ trace: ApiTrace; spans: ApiSpan[] }>(`/traces/${shadowEval.trace_id}`)
       .then(d => setChildOutput(d.trace.output || null))
       .catch(() => setChildOutput("error"));
-  }, [tab, shadowEval, childOutput]);
+  }, [tab, shadowEval, childOutput, isRootNode]);
 
-  // Reset child output when the node changes.
+  // Reset selected-node Shadow output when the node changes.
   useEffect(() => { setChildOutput(null); }, [node?.id]);
 
   if (!node && !trace) {
@@ -951,20 +1035,152 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
     return <TraceOverviewPane trace={trace} insights={insights} onHighlightNode={onHighlightNode} />;
   }
 
-  const meta = (span?.metadata || {}) as Record<string, unknown>;
+  const rawMetadata = span?.metadata ?? {};
+  const meta: Record<string, unknown> =
+    typeof rawMetadata === "string"
+      ? (() => {
+          try {
+            const parsed = JSON.parse(rawMetadata);
+            return parsed && typeof parsed === "object" ? parsed : {};
+          } catch {
+            return {};
+          }
+        })()
+      : (rawMetadata as Record<string, unknown>);
+
   const isBottleneck = insights?.performance?.bottleneck?.span_id === node.id;
   const shadow = insights?.shadow;
   const tabs = ["overview", "input", "context", "output", "quality"];
 
-  // Prefer I/O recorded on the selected span. Shadow evaluation data is an
-  // evaluation signal, not a substitute for every workflow node's I/O.
-  const realInput = span?.input ?? (meta.input as string) ?? (node?.id === trace?.id ? trace?.input : null) ?? null;
-  const realContext = span?.context ?? (meta.context as string) ?? (node?.id === trace?.id ? trace?.context : null) ?? null;
-  const realOutput = span?.output ?? (meta.output as string) ?? (node?.id === trace?.id ? trace?.output : null) ?? null;
+  const toDisplayValue = (value: unknown): string | null => {
+    if (value == null || value === "") return null;
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value, null, 2); }
+    catch { return String(value); }
+  };
+
+  // Accept the payload names commonly used by SDKs/telemetry producers.
+  // This is still the selected NODE'S payload; these are only fallbacks for
+  // spans whose producer put the data inside metadata.
+  const firstValue = (...values: unknown[]) =>
+    values.find(v => v !== null && v !== undefined && v !== "") ?? null;
+
+  const metadataInput = firstValue(
+    meta.input,
+    meta.prompt,
+    meta.request,
+    meta.inputs,
+    meta.messages,
+    (meta.payload as Record<string, unknown> | undefined)?.input,
+    (meta.payload as Record<string, unknown> | undefined)?.prompt,
+  );
+
+  const metadataContext = firstValue(
+    meta.context,
+    meta.retrieved_context,
+    meta.retrieved_documents,
+    meta.documents,
+    meta.sources,
+    meta.retrieval,
+    (meta.payload as Record<string, unknown> | undefined)?.context,
+    (meta.payload as Record<string, unknown> | undefined)?.documents,
+  );
+
+  const metadataOutput = firstValue(
+    meta.output,
+    meta.response,
+    meta.result,
+    meta.result_text,
+    meta.completion,
+    meta.response_text,
+    meta.outputs,
+    (meta.payload as Record<string, unknown> | undefined)?.output,
+    (meta.payload as Record<string, unknown> | undefined)?.response,
+  );
+
+  /*
+   * IMPORTANT:
+   * - Root node: the user's prompt is trace.input. Do not show the workflow
+   *   name/agent name as the prompt just because a root span also has metadata.
+   * - Child node: only use that child span's input/context/output (or its
+   *   metadata). Never substitute the root trace payload.
+   */
+  const realInput = isRootNode
+    ? (
+        toDisplayValue(trace?.input) ??
+        toDisplayValue(span?.input) ??
+        toDisplayValue(metadataInput) ??
+        toDisplayValue(node.input) ??
+        toDisplayValue(shadowEval?.input)
+      )
+    : (
+        toDisplayValue(span?.input) ??
+        toDisplayValue(metadataInput) ??
+        toDisplayValue(node.input)
+      );
+
+  const realContext = isRootNode
+    ? (
+        toDisplayValue(trace?.context) ??
+        toDisplayValue(span?.context) ??
+        toDisplayValue(metadataContext) ??
+        toDisplayValue(node.context) ??
+        toDisplayValue(shadowEval?.context)
+      )
+    : (
+        toDisplayValue(span?.context) ??
+        toDisplayValue(metadataContext) ??
+        toDisplayValue(node.context)
+      );
+
+  const realOutput = isRootNode
+    ? (
+        toDisplayValue(trace?.output) ??
+        toDisplayValue(span?.output) ??
+        toDisplayValue(metadataOutput) ??
+        toDisplayValue(node.output)
+      )
+    : (
+        toDisplayValue(span?.output) ??
+        toDisplayValue(metadataOutput) ??
+        toDisplayValue(node.output)
+      );
+
+  const inputSource = isRootNode
+    ? (
+        trace?.input != null ? "trace / prompt" :
+        span?.input != null ? "span" :
+        metadataInput != null ? "metadata" :
+        node.input != null ? "graph node" :
+        shadowEval?.input != null ? "shadow prompt" :
+        null
+      )
+    : (
+        span?.input != null ? "span" :
+        metadataInput != null ? "metadata" :
+        node.input != null ? "graph node" :
+        null
+      );
+
+  const contextSource = isRootNode
+    ? (
+        trace?.context != null ? "trace" :
+        span?.context != null ? "span" :
+        metadataContext != null ? "metadata" :
+        node.context != null ? "graph node" :
+        shadowEval?.context != null ? "shadow" :
+        null
+      )
+    : (
+        span?.context != null ? "span" :
+        metadataContext != null ? "metadata" :
+        node.context != null ? "graph node" :
+        null
+      );
 
   return (
     <div className="flex flex-col h-full">
-      <div className="p-4 border-b border-cp-border flex-shrink-0">
+      <div className="p-4 border-b border-cp-border flex-shrink-0 bg-cp-surface">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs px-2 py-0.5 rounded font-semibold uppercase tracking-wide"
             style={{ background: KIND_COLOR[node.kind] + "22", color: KIND_COLOR[node.kind] }}>
@@ -979,7 +1195,10 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
           </div>
         </div>
 
-        <div className="text-base font-semibold text-cp-text">{node.name}</div>
+        <div className="flex items-center gap-2">
+          <div className="text-base font-semibold text-cp-text truncate">{node.name}</div>
+          {isRootNode && <span className="text-[10px] px-1.5 py-0.5 rounded bg-cp-purple/10 text-cp-purple border border-cp-purple/20">ROOT</span>}
+        </div>
         {node.model && (
           <div className="text-xs text-cp-secondary font-mono mt-0.5">{node.model}</div>
         )}
@@ -1006,11 +1225,11 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
         </div>
       </div>
 
-      <div className="flex border-b border-cp-border flex-shrink-0">
+      <div className="flex border-b border-cp-border flex-shrink-0 overflow-x-auto">
         {tabs.map(t => (
           <button key={t} onClick={() => setTab(t)}
-            className={`px-3 py-2 text-xs font-medium capitalize transition-colors ${
-              tab === t ? "text-cp-text border-b border-cp-purple -mb-px" : "text-cp-secondary hover:text-cp-text"
+            className={`shrink-0 px-3 py-2.5 text-xs font-medium capitalize transition-colors ${
+              tab === t ? "text-cp-text border-b-2 border-cp-purple -mb-px" : "text-cp-secondary hover:text-cp-text"
             }`}>
             {t}
           </button>
@@ -1018,6 +1237,14 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {(tab === "input" || tab === "context") && (
+          <div className="flex items-center justify-between rounded-lg border border-cp-border bg-cp-elevated/50 px-3 py-2">
+            <span className="text-[11px] text-cp-muted">Recorded source</span>
+            <span className="text-[10px] uppercase tracking-wider font-semibold text-cp-secondary">
+              {(tab === "input" ? inputSource : contextSource) || "none"}
+            </span>
+          </div>
+        )}
         {tab === "overview" && (
           <>
             {isBottleneck && insights?.performance?.bottleneck && (
@@ -1100,20 +1327,38 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
 }
 
 function CodeBlock({ label, value }: { label: string; value: string | null }) {
-  if (!value) {
-    return (
-      <div>
-        <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">{label}</div>
-        <div className="text-xs text-cp-muted italic">N/A — not recorded for this span</div>
-      </div>
-    );
-  }
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch { /* clipboard may be unavailable in an embedded browser */ }
+  };
+
   return (
-    <div>
-      <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">{label}</div>
-      <pre className="text-xs text-cp-text font-mono bg-cp-elevated rounded p-3 whitespace-pre-wrap break-words border border-cp-border max-h-96 overflow-y-auto">
-        {value}
-      </pre>
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-[11px] font-semibold text-cp-muted uppercase tracking-wider">{label}</div>
+        {value && (
+          <button onClick={copy} className="text-[11px] text-cp-secondary hover:text-cp-text px-2 py-1 rounded border border-cp-border hover:bg-cp-elevated transition-colors">
+            {copied ? "Copied" : "Copy"}
+          </button>
+        )}
+      </div>
+      {!value ? (
+        <div className="rounded-lg border border-dashed border-cp-border bg-cp-elevated/40 p-4 text-xs text-cp-muted">
+          <div className="font-medium text-cp-secondary mb-1">Not recorded</div>
+          This span did not persist a {label.toLowerCase()} payload.
+        </div>
+      ) : (
+        <div className="rounded-lg border border-[#3a3835] bg-[#111110] overflow-hidden shadow-inner">
+          <pre className="text-[12px] leading-5 text-[#f3f4f6] font-mono p-4 whitespace-pre-wrap break-words max-h-[520px] overflow-auto">
+            {value}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
@@ -1482,8 +1727,40 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
     Promise.all([
       apiGet<ApiTraceDetail>(`/traces/${traceId}`),
       apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
-    ]).then(([d, ins]) => {
-      setDetail(d);
+      // /spans/{trace_id} is the canonical per-span I/O payload.
+      apiGet<ApiSpan[]>(`/spans/${traceId}`).catch(() => []),
+    ]).then(([d, ins, persistedSpans]) => {
+      // Some backend versions return the span tree correctly but omit
+      // input/output from the graph/detail representation. Enrich it from
+      // the flat spans endpoint before the graph is built.
+      const ioById = new Map(
+        persistedSpans.map(span => [
+          span.id,
+          {
+            input: span.input ?? null,
+            output: span.output ?? null,
+            context: span.context ?? null,
+          },
+        ])
+      );
+
+      const enrichSpan = (span: ApiSpan): ApiSpan => {
+        const io = ioById.get(span.id);
+        return {
+          ...span,
+          input: span.input ?? io?.input ?? null,
+          output: span.output ?? io?.output ?? null,
+          context: span.context ?? io?.context ?? null,
+          children: span.children?.map(enrichSpan),
+        };
+      };
+
+      const enrichedSpans = (d.spans || []).map(enrichSpan);
+
+      setDetail({
+        ...d,
+        spans: enrichedSpans,
+      });
       setInsights(ins);
     }).catch(err => setError(err.message))
       .finally(() => setLoading(false));
@@ -1574,7 +1851,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
         </div>
 
         {/* Center: canvas with grey outer frame */}
-        <div className="flex-1 flex flex-col overflow-hidden bg-cp-elevated p-3">
+        <div className="flex-1 flex flex-col overflow-hidden bg-[#20201f] p-2">
           <div className="flex-1 flex flex-col rounded-xl overflow-hidden border border-cp-border/40 shadow-sm">
             {loading ? (
               <div className="flex-1 flex items-center justify-center text-cp-secondary text-sm gap-2 bg-cp-canvas">
@@ -1597,7 +1874,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
         </div>
 
         {/* Right: inspector */}
-        <div className="w-80 border-l border-cp-border flex flex-col flex-shrink-0 bg-cp-surface overflow-hidden">
+        <div className="w-[360px] border-l border-cp-border flex flex-col flex-shrink-0 bg-cp-surface overflow-hidden">
           {loading ? (
             <div className="flex-1 flex items-center justify-center text-cp-muted text-xs gap-2">
               <Loader2 size={14} className="animate-spin" /> Loading…
@@ -1756,7 +2033,7 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
                   <button key={t.id} onClick={() => onSelectTrace(t.id)}
                     className={`w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
                     <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: statusColor(t.status) }} />
-                    <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
+                    <span className="text-xs font-medium text-cp-secondary flex-1 truncate">Run #{app.traces.length - i}</span>
                     <span className="text-xs text-cp-muted">{fmtTime(t.created_at)}</span>
                     <span className="text-xs font-mono text-cp-secondary w-16 text-right">{fmtMs(t.latency_ms)}</span>
                     {t.factuality_score != null && (
