@@ -152,6 +152,7 @@ interface ApiAnalytics {
     blocked_requests: number;
   };
   models: Array<{
+    provider: string;
     model: string;
     requests: number;
     average_latency_ms: number;
@@ -2142,8 +2143,10 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
                   {analytics.models.map(m => {
                     const maxReqs = Math.max(...analytics.models.map(x => x.requests));
                     return (
-                      <div key={m.model} className="flex items-center gap-3 text-xs">
-                        <span className="font-mono text-cp-text w-36 truncate">{m.model}</span>
+                      <div key={`${m.provider}:${m.model}`} className="flex items-center gap-3 text-xs">
+                        <span className="font-mono text-cp-text w-44 truncate">
+                          {m.provider ? `${m.provider} / ${m.model}` : m.model}
+                        </span>
                         <div className="flex-1 h-1.5 bg-cp-elevated rounded-full">
                           <div className="h-full rounded-full bg-cp-blue"
                             style={{ width: `${(m.requests / maxReqs) * 100}%` }} />
@@ -2316,9 +2319,11 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
                   {analytics.models.map(m => {
                     const maxCost = Math.max(...analytics.models.map(x => x.total_cost_usd));
                     return (
-                      <div key={m.model}>
+                      <div key={`${m.provider}:${m.model}`}>
                         <div className="flex justify-between text-xs mb-1">
-                          <span className="font-mono text-cp-text">{m.model}</span>
+                          <span className="font-mono text-cp-text">
+                            {m.provider ? `${m.provider} / ${m.model}` : m.model}
+                          </span>
                           <span className="text-cp-secondary">{fmtCost(m.total_cost_usd)}</span>
                         </div>
                         <div className="h-1.5 bg-cp-elevated rounded-full">

@@ -813,10 +813,9 @@ def get_analytics_overview():
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(output_tokens), 0)
                 FROM traces
-                WHERE NOT (
-                    provider = 'controlplane'
-                    AND model = 'workflow'
-                )
+                WHERE parent_trace_id IS NOT NULL
+                  AND model IS NOT NULL
+                  AND model <> ''
                 GROUP BY provider, model
                 ORDER BY COUNT(*) DESC
                 """
@@ -1095,6 +1094,9 @@ def get_analytics():
                         0
                     )
                 FROM traces
+                WHERE parent_trace_id IS NOT NULL
+                  AND model IS NOT NULL
+                  AND model <> ''
                 GROUP BY provider, model
                 ORDER BY COUNT(*) DESC
                 """
