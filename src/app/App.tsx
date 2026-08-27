@@ -667,55 +667,122 @@ function getResolvedRunDuration(
   return null;
 }
 
-function getRunCostUsd(spans: ApiSpan[]): number | null {
+
+function getMetadataCost(value: unknown): number | null {
+  if (value == null) return null;
+
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+    try {
+      return getMetadataCost(JSON.parse(value));
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  if (typeof value !== "object") return null;
+
+  const obj = value as Record<string, unknown>;
+  const directKeys = [
+    "cost_usd",
+    "estimated_cost_usd",
+    "total_cost_usd",
+    "total_cost",
+    "cost",
+  ];
+
+  for (const key of directKeys) {
+    const candidate = obj[key];
+    const numeric =
+      typeof candidate === "number"
+        ? candidate
+        : typeof candidate === "string"
+          ? Number(candidate)
+          : NaN;
+
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  }
+
   let total = 0;
   let found = false;
 
-  for (const span of flattenSpans(spans)) {
-    const raw = span.metadata;
-    const meta: Record<string, unknown> =
-      typeof raw === "string"
-        ? (() => {
-            try {
-              const parsed = JSON.parse(raw);
-              return parsed && typeof parsed === "object" ? parsed : {};
-            } catch {
-              return {};
-            }
-          })()
-        : (raw || {});
-
-    const usage =
-      meta.usage && typeof meta.usage === "object"
-        ? meta.usage as Record<string, unknown>
-        : {};
-
-    const values = [
-      meta.cost,
-      meta.cost_usd,
-      meta.estimated_cost_usd,
-      usage.cost,
-      usage.cost_usd,
-      usage.estimated_cost_usd,
-    ];
-
-    for (const value of values) {
-      const amount =
-        typeof value === "number"
-          ? value
-          : typeof value === "string"
-            ? Number(value)
+  for (const [key, candidate] of Object.entries(obj)) {
+    if (key === "input_cost" || key === "output_cost") {
+      const numeric =
+        typeof candidate === "number"
+          ? candidate
+          : typeof candidate === "string"
+            ? Number(candidate)
             : NaN;
-
-      if (Number.isFinite(amount) && amount > 0) {
-        total += amount;
+      if (Number.isFinite(numeric) && numeric > 0) {
+        total += numeric;
         found = true;
-        break;
+      }
+      continue;
+    }
+
+    if (candidate && typeof candidate === "object") {
+      const nested = getMetadataCost(candidate);
+      if (nested != null && nested > 0) {
+        total += nested;
+        found = true;
       }
     }
   }
 
   return found ? total : null;
+}
+
+function getChildTraceCost(allTraces: ApiTrace[], rootTraceId: string): number | null {
+  const total = allTraces
+    .filter(t => t.parent_trace_id === rootTraceId)
+    .reduce((sum, t) => {
+      const cost = t.estimated_cost_usd;
+      return sum + (cost != null && cost > 0 ? cost : 0);
+    }, 0);
+
+  return total > 0 ? total : null;
+}
+
+function getResolvedRunCost(
+  trace: ApiTrace | null,
+  spans: ApiSpan[],
+  insights: ApiInsights | null = null,
+): number | null {
+  if (trace?.estimated_cost_usd != null && trace.estimated_cost_usd > 0) {
+    return trace.estimated_cost_usd;
+  }
+
+  const insightCost = insights?.performance?.cost_usd;
+  if (insightCost != null && insightCost > 0) {
+    return insightCost;
+  }
+
+  const flatSpans = flattenSpans(spans);
+  let spanCost = 0;
+  let foundSpanCost = false;
+
+  for (const span of flatSpans) {
+    const cost = getMetadataCost(span.metadata);
+    if (cost != null && cost > 0) {
+      spanCost += cost;
+      foundSpanCost = true;
+    }
+  }
+
+  if (foundSpanCost) return spanCost;
+
+  const shadowCost = (insights?.shadow_evaluations || []).reduce((sum, evaluation) => {
+    const cost = evaluation.estimated_cost_usd;
+    return sum + (cost != null && cost > 0 ? cost : 0);
+  }, 0);
+
+  return shadowCost > 0 ? shadowCost : null;
 }
 
 function fmtCost(usd: number | null | undefined): string {
@@ -1137,10 +1204,11 @@ interface InspectorProps {
   trace: ApiTrace | null;
   flatSpans: ApiSpan[];
   insights: ApiInsights | null;
+  traceCost?: number | null;
   onHighlightNode: (id: string | null) => void;
 }
 
-function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: InspectorProps) {
+function NodeInspector({ node, trace, flatSpans, insights, traceCost, onHighlightNode }: InspectorProps) {
   const [tab, setTab] = useState("overview");
   // Shadow output is only a fallback for the ROOT workflow node.
   // Never use one trace's Shadow result as the output of an arbitrary child node.
@@ -1189,7 +1257,7 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
   }
 
   if (!node) {
-    return <TraceOverviewPane trace={trace} insights={insights} flatSpans={flatSpans} onHighlightNode={onHighlightNode} />;
+    return <TraceOverviewPane trace={trace} insights={insights} flatSpans={flatSpans} traceCost={traceCost} onHighlightNode={onHighlightNode} />;
   }
 
   const rawMetadata = span?.metadata ?? {};
@@ -1641,35 +1709,21 @@ function ShadowQualityPane({
   );
 }
 
-function TraceOverviewPane({ trace, insights, flatSpans, onHighlightNode }: {
+function TraceOverviewPane({ trace, insights, flatSpans, traceCost, onHighlightNode }: {
   trace: ApiTrace | null;
   insights: ApiInsights | null;
   flatSpans: ApiSpan[];
+  traceCost?: number | null;
   onHighlightNode: (id: string | null) => void;
 }) {
   if (!trace) return null;
   const shadow = insights?.shadow;
   const bottleneck = insights?.performance?.bottleneck;
-  const resolvedLatency =
-    trace.latency_ms != null && trace.latency_ms > 0
-      ? trace.latency_ms
-      : insights?.performance?.workflow_latency_ms != null &&
-          insights.performance.workflow_latency_ms > 0
-        ? insights.performance.workflow_latency_ms
-        : bottleneck?.duration_ms != null && bottleneck.duration_ms > 0
-          ? bottleneck.duration_ms
-          : trace.latency_ms;
-
-  const spanCost = getRunCostUsd(flatSpans);
+  const resolvedLatency = getResolvedRunDuration(trace, flatSpans, insights);
   const resolvedCost =
-    trace.estimated_cost_usd != null && trace.estimated_cost_usd > 0
-      ? trace.estimated_cost_usd
-      : insights?.performance?.cost_usd != null &&
-          insights.performance.cost_usd > 0
-        ? insights.performance.cost_usd
-        : spanCost != null && spanCost > 0
-          ? spanCost
-          : trace.estimated_cost_usd;
+    traceCost != null && traceCost > 0
+      ? traceCost
+      : getResolvedRunCost(trace, flatSpans, insights);
 
   const factColor = shadow?.average_factuality_score != null
     ? shadow.average_factuality_score >= 0.8 ? "#16a34a" : shadow.average_factuality_score >= 0.6 ? "#d97706" : "#dc2626"
@@ -1866,7 +1920,14 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
   const [runDurations, setRunDurations] = useState<Record<string, number | null>>({});
+  const [allTraces, setAllTraces] = useState<ApiTrace[]>([]);
 
+
+  useEffect(() => {
+    apiGet<ApiTrace[]>("/traces?limit=500")
+      .then(setAllTraces)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const tracesNeedingDuration = sessionTraces.filter(
@@ -1949,12 +2010,16 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   const currentRunDuration = currentTrace && detail
     ? getResolvedRunDuration(currentTrace, detail.spans || [], insights)
     : currentTrace?.latency_ms ?? null;
+  const childTraceCost = currentTrace
+    ? getChildTraceCost(allTraces, currentTrace.id)
+    : null;
+
   const currentRunCost =
-    currentTrace?.estimated_cost_usd != null && currentTrace.estimated_cost_usd > 0
-      ? currentTrace.estimated_cost_usd
-      : detail
-        ? getRunCostUsd(detail.spans || [])
-        : currentTrace?.estimated_cost_usd ?? null;
+    childTraceCost != null && childTraceCost > 0
+      ? childTraceCost
+      : currentTrace
+        ? getResolvedRunCost(currentTrace, detail?.spans || [], insights)
+        : null;
 
   return (
     <div className="flex flex-col h-screen bg-cp-app">
@@ -2073,6 +2138,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
               trace={currentTrace}
               flatSpans={flatSpans}
               insights={insights}
+              traceCost={currentRunCost}
               onHighlightNode={setHighlightedNodeId}
             />
           )}
