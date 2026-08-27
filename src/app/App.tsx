@@ -615,6 +615,109 @@ function fmtMs(ms: number | null | undefined): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+function getRunDurationMs(spans: ApiSpan[]): number | null {
+  const flatSpans = flattenSpans(spans);
+
+  const starts = flatSpans
+    .map(span => span.started_at ? new Date(span.started_at).getTime() : NaN)
+    .filter(Number.isFinite);
+
+  const ends = flatSpans
+    .map(span => span.ended_at ? new Date(span.ended_at).getTime() : NaN)
+    .filter(Number.isFinite);
+
+  if (starts.length > 0 && ends.length > 0) {
+    const duration = Math.max(...ends) - Math.min(...starts);
+    if (duration > 0) return duration;
+  }
+
+  // Some Default / All Traces records do not persist span timestamps.
+  // Their individual span durations are still available.
+  const durations = flatSpans
+    .map(span => span.duration_ms)
+    .filter((duration): duration is number => duration != null && duration > 0);
+
+  return durations.length > 0 ? Math.max(...durations) : null;
+}
+
+function getResolvedRunDuration(
+  trace: ApiTrace,
+  spans: ApiSpan[],
+  insights: ApiInsights | null = null,
+): number | null {
+  if (trace.latency_ms != null && trace.latency_ms > 0) {
+    return trace.latency_ms;
+  }
+
+  const workflowLatency = insights?.performance?.workflow_latency_ms;
+  if (workflowLatency != null && workflowLatency > 0) {
+    return workflowLatency;
+  }
+
+  const spanDuration = getRunDurationMs(spans);
+  if (spanDuration != null && spanDuration > 0) {
+    return spanDuration;
+  }
+
+  const bottleneckDuration = insights?.performance?.bottleneck?.duration_ms;
+  if (bottleneckDuration != null && bottleneckDuration > 0) {
+    return bottleneckDuration;
+  }
+
+  return null;
+}
+
+function getRunCostUsd(spans: ApiSpan[]): number | null {
+  let total = 0;
+  let found = false;
+
+  for (const span of flattenSpans(spans)) {
+    const raw = span.metadata;
+    const meta: Record<string, unknown> =
+      typeof raw === "string"
+        ? (() => {
+            try {
+              const parsed = JSON.parse(raw);
+              return parsed && typeof parsed === "object" ? parsed : {};
+            } catch {
+              return {};
+            }
+          })()
+        : (raw || {});
+
+    const usage =
+      meta.usage && typeof meta.usage === "object"
+        ? meta.usage as Record<string, unknown>
+        : {};
+
+    const values = [
+      meta.cost,
+      meta.cost_usd,
+      meta.estimated_cost_usd,
+      usage.cost,
+      usage.cost_usd,
+      usage.estimated_cost_usd,
+    ];
+
+    for (const value of values) {
+      const amount =
+        typeof value === "number"
+          ? value
+          : typeof value === "string"
+            ? Number(value)
+            : NaN;
+
+      if (Number.isFinite(amount) && amount > 0) {
+        total += amount;
+        found = true;
+        break;
+      }
+    }
+  }
+
+  return found ? total : null;
+}
+
 function fmtCost(usd: number | null | undefined): string {
   if (usd == null) return "N/A";
   if (usd === 0) return "$0.00";
@@ -1086,7 +1189,7 @@ function NodeInspector({ node, trace, flatSpans, insights, onHighlightNode }: In
   }
 
   if (!node) {
-    return <TraceOverviewPane trace={trace} insights={insights} onHighlightNode={onHighlightNode} />;
+    return <TraceOverviewPane trace={trace} insights={insights} flatSpans={flatSpans} onHighlightNode={onHighlightNode} />;
   }
 
   const rawMetadata = span?.metadata ?? {};
@@ -1538,14 +1641,35 @@ function ShadowQualityPane({
   );
 }
 
-function TraceOverviewPane({ trace, insights, onHighlightNode }: {
+function TraceOverviewPane({ trace, insights, flatSpans, onHighlightNode }: {
   trace: ApiTrace | null;
   insights: ApiInsights | null;
+  flatSpans: ApiSpan[];
   onHighlightNode: (id: string | null) => void;
 }) {
   if (!trace) return null;
   const shadow = insights?.shadow;
   const bottleneck = insights?.performance?.bottleneck;
+  const resolvedLatency =
+    trace.latency_ms != null && trace.latency_ms > 0
+      ? trace.latency_ms
+      : insights?.performance?.workflow_latency_ms != null &&
+          insights.performance.workflow_latency_ms > 0
+        ? insights.performance.workflow_latency_ms
+        : bottleneck?.duration_ms != null && bottleneck.duration_ms > 0
+          ? bottleneck.duration_ms
+          : trace.latency_ms;
+
+  const spanCost = getRunCostUsd(flatSpans);
+  const resolvedCost =
+    trace.estimated_cost_usd != null && trace.estimated_cost_usd > 0
+      ? trace.estimated_cost_usd
+      : insights?.performance?.cost_usd != null &&
+          insights.performance.cost_usd > 0
+        ? insights.performance.cost_usd
+        : spanCost != null && spanCost > 0
+          ? spanCost
+          : trace.estimated_cost_usd;
 
   const factColor = shadow?.average_factuality_score != null
     ? shadow.average_factuality_score >= 0.8 ? "#16a34a" : shadow.average_factuality_score >= 0.6 ? "#d97706" : "#dc2626"
@@ -1574,8 +1698,8 @@ function TraceOverviewPane({ trace, insights, onHighlightNode }: {
         {/* Metrics grid */}
         <div className="grid grid-cols-2 gap-2">
           {[
-            { label: "Latency", value: fmtMs(trace.latency_ms) },
-            { label: "Cost", value: fmtCost(trace.estimated_cost_usd) },
+            { label: "Latency", value: fmtMs(resolvedLatency) },
+            { label: "Cost", value: fmtCost(resolvedCost) },
             { label: "In Tokens", value: trace.input_tokens != null ? trace.input_tokens.toLocaleString() : "N/A" },
             { label: "Out Tokens", value: trace.output_tokens != null ? trace.output_tokens.toLocaleString() : "N/A" },
           ].map(({ label, value }) => (
@@ -1741,6 +1865,39 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   const [error, setError] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
+  const [runDurations, setRunDurations] = useState<Record<string, number | null>>({});
+
+
+  useEffect(() => {
+    const tracesNeedingDuration = sessionTraces.filter(
+      trace => (trace.latency_ms == null || trace.latency_ms <= 0) && runDurations[trace.id] === undefined
+    );
+
+    if (tracesNeedingDuration.length === 0) return;
+
+    Promise.all(
+      tracesNeedingDuration.map(async trace => {
+        try {
+          const [data, traceInsights] = await Promise.all([
+            apiGet<ApiTraceDetail>(`/traces/${trace.id}`),
+            apiGet<ApiInsights>(`/traces/${trace.id}/insights`).catch(() => null),
+          ]);
+          return [
+            trace.id,
+            getResolvedRunDuration(data.trace, data.spans || [], traceInsights),
+          ] as const;
+        } catch {
+          return [trace.id, null] as const;
+        }
+      })
+    ).then(results => {
+      setRunDurations(previous => {
+        const next = { ...previous };
+        for (const [id, duration] of results) next[id] = duration;
+        return next;
+      });
+    });
+  }, [sessionTraces, runDurations]);
 
   useEffect(() => {
     setLoading(true);
@@ -1789,6 +1946,16 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   const currentTrace = detail?.trace ?? sessionTraces.find(t => t.id === traceId) ?? null;
   const factScore = currentTrace?.factuality_score;
 
+  const currentRunDuration = currentTrace && detail
+    ? getResolvedRunDuration(currentTrace, detail.spans || [], insights)
+    : currentTrace?.latency_ms ?? null;
+  const currentRunCost =
+    currentTrace?.estimated_cost_usd != null && currentTrace.estimated_cost_usd > 0
+      ? currentTrace.estimated_cost_usd
+      : detail
+        ? getRunCostUsd(detail.spans || [])
+        : currentTrace?.estimated_cost_usd ?? null;
+
   return (
     <div className="flex flex-col h-screen bg-cp-app">
       {/* Header */}
@@ -1807,9 +1974,9 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
             <span className="w-1.5 h-1.5 rounded-full" style={{ background: statusColor(currentTrace.status) }} />
             <span className="text-xs text-cp-secondary capitalize">{currentTrace.status}</span>
             <div className="w-px h-4 bg-cp-border" />
-            <span className="text-xs text-cp-muted">{fmtMs(currentTrace.latency_ms)}</span>
-            {currentTrace.estimated_cost_usd != null && (
-              <span className="text-xs text-cp-muted">{fmtCost(currentTrace.estimated_cost_usd)}</span>
+            <span className="text-xs text-cp-muted">{fmtMs(currentRunDuration)}</span>
+            {currentRunCost != null && (
+              <span className="text-xs text-cp-muted">{fmtCost(currentRunCost)}</span>
             )}
           </>
         )}
@@ -1851,7 +2018,11 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
                   </div>
                   <div className="text-xs text-cp-muted pl-3">{dateLabel} · {timeLabel}</div>
                   <div className="flex gap-2 mt-1 pl-3 text-xs text-cp-muted">
-                    <span>{fmtMs(t.latency_ms)}</span>
+                    <span>{fmtMs(
+                      t.latency_ms != null && t.latency_ms > 0
+                        ? t.latency_ms
+                        : runDurations[t.id] ?? t.latency_ms
+                    )}</span>
                     {t.factuality_score != null && (
                       <span style={{
                         color: t.factuality_score >= 0.8 ? "#16a34a"
@@ -1926,6 +2097,8 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
   const [analytics, setAnalytics] = useState<ApiAnalytics | null>(null);
   const [search, setSearch] = useState("");
 
+  const [runDurations, setRunDurations] = useState<Record<string, number | null>>({});
+
   useEffect(() => {
     apiGet<ApiAnalytics>("/analytics").then(setAnalytics).catch(() => {});
   }, []);
@@ -1971,6 +2144,40 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
   ];
 
   const hc = healthColor(app.health);
+
+
+  useEffect(() => {
+    const tracesNeedingDuration = app.traces.filter(
+      trace =>
+        (trace.latency_ms == null || trace.latency_ms <= 0) &&
+        runDurations[trace.id] === undefined
+    );
+
+    if (tracesNeedingDuration.length === 0) return;
+
+    Promise.all(
+      tracesNeedingDuration.map(async trace => {
+        try {
+          const [data, traceInsights] = await Promise.all([
+            apiGet<ApiTraceDetail>(`/traces/${trace.id}`),
+            apiGet<ApiInsights>(`/traces/${trace.id}/insights`).catch(() => null),
+          ]);
+          return [
+            trace.id,
+            getResolvedRunDuration(data.trace, data.spans || [], traceInsights),
+          ] as const;
+        } catch {
+          return [trace.id, null] as const;
+        }
+      })
+    ).then(results => {
+      setRunDurations(previous => {
+        const next = { ...previous };
+        for (const [id, duration] of results) next[id] = duration;
+        return next;
+      });
+    });
+  }, [app.traces, runDurations]);
 
   return (
     <div className="flex flex-col h-screen bg-cp-app">
@@ -2052,7 +2259,11 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
                     <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: statusColor(t.status) }} />
                     <span className="text-xs font-medium text-cp-secondary flex-1 truncate">Run #{app.traces.length - i}</span>
                     <span className="text-xs text-cp-muted">{fmtTime(t.created_at)}</span>
-                    <span className="text-xs font-mono text-cp-secondary w-16 text-right">{fmtMs(t.latency_ms)}</span>
+                    <span className="text-xs font-mono text-cp-secondary w-16 text-right">{fmtMs(
+                      t.latency_ms != null && t.latency_ms > 0
+                        ? t.latency_ms
+                        : runDurations[t.id] ?? t.latency_ms
+                    )}</span>
                     {t.factuality_score != null && (
                       <span className="text-xs font-mono w-10 text-right" style={{
                         color: t.factuality_score >= 0.8 ? "#16a34a" : t.factuality_score >= 0.6 ? "#d97706" : "#dc2626"
@@ -2100,7 +2311,11 @@ function ApplicationWorkspace({ app, onBack, onSelectTrace }: AppWorkspaceProps)
                   </span>
                   <span className="text-xs font-mono text-cp-secondary flex-1 truncate">{t.id}</span>
                   <span className="text-xs text-cp-muted w-28 truncate">{t.model || "N/A"}</span>
-                  <span className="text-xs font-mono text-cp-secondary w-20 text-right">{fmtMs(t.latency_ms)}</span>
+                  <span className="text-xs font-mono text-cp-secondary w-20 text-right">{fmtMs(
+                      t.latency_ms != null && t.latency_ms > 0
+                        ? t.latency_ms
+                        : runDurations[t.id] ?? t.latency_ms
+                    )}</span>
                   <span className="text-xs font-mono text-cp-muted w-16 text-right">{fmtCost(t.estimated_cost_usd)}</span>
                   <span className="text-xs font-mono w-14 text-right" style={{
                     color: t.factuality_score == null ? "#9e9e9b"
