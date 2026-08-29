@@ -812,6 +812,47 @@ function getChildTraceCost(allTraces: ApiTrace[], rootTraceId: string): number |
   return total > 0 ? total : null;
 }
 
+function getChildTraceMetrics(
+  allTraces: ApiTrace[],
+  rootTraceId: string,
+): {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cost: number | null;
+} {
+  const children = allTraces.filter(t => t.parent_trace_id === rootTraceId);
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cost = 0;
+  let hasInput = false;
+  let hasOutput = false;
+  let hasCost = false;
+
+  for (const child of children) {
+    if (child.input_tokens != null && child.input_tokens > 0) {
+      inputTokens += child.input_tokens;
+      hasInput = true;
+    }
+
+    if (child.output_tokens != null && child.output_tokens > 0) {
+      outputTokens += child.output_tokens;
+      hasOutput = true;
+    }
+
+    if (child.estimated_cost_usd != null && child.estimated_cost_usd > 0) {
+      cost += child.estimated_cost_usd;
+      hasCost = true;
+    }
+  }
+
+  return {
+    inputTokens: hasInput ? inputTokens : null,
+    outputTokens: hasOutput ? outputTokens : null,
+    cost: hasCost ? cost : null,
+  };
+}
+
 function getResolvedRunCost(
   trace: ApiTrace | null,
   spans: ApiSpan[],
@@ -1268,10 +1309,21 @@ interface InspectorProps {
   flatSpans: ApiSpan[];
   insights: ApiInsights | null;
   traceCost?: number | null;
+  traceInputTokens?: number | null;
+  traceOutputTokens?: number | null;
   onHighlightNode: (id: string | null) => void;
 }
 
-function NodeInspector({ node, trace, flatSpans, insights, traceCost, onHighlightNode }: InspectorProps) {
+function NodeInspector({
+  node,
+  trace,
+  flatSpans,
+  insights,
+  traceCost,
+  traceInputTokens,
+  traceOutputTokens,
+  onHighlightNode,
+}: InspectorProps) {
   const [tab, setTab] = useState("overview");
   // Shadow output is only a fallback for the ROOT workflow node.
   // Never use one trace's Shadow result as the output of an arbitrary child node.
@@ -1320,7 +1372,17 @@ function NodeInspector({ node, trace, flatSpans, insights, traceCost, onHighligh
   }
 
   if (!node) {
-    return <TraceOverviewPane trace={trace} insights={insights} flatSpans={flatSpans} traceCost={traceCost} onHighlightNode={onHighlightNode} />;
+    return (
+      <TraceOverviewPane
+        trace={trace}
+        insights={insights}
+        flatSpans={flatSpans}
+        traceCost={traceCost}
+        traceInputTokens={traceInputTokens}
+        traceOutputTokens={traceOutputTokens}
+        onHighlightNode={onHighlightNode}
+      />
+    );
   }
 
   const rawMetadata = span?.metadata ?? {};
@@ -1772,11 +1834,21 @@ function ShadowQualityPane({
   );
 }
 
-function TraceOverviewPane({ trace, insights, flatSpans, traceCost, onHighlightNode }: {
+function TraceOverviewPane({
+  trace,
+  insights,
+  flatSpans,
+  traceCost,
+  traceInputTokens,
+  traceOutputTokens,
+  onHighlightNode,
+}: {
   trace: ApiTrace | null;
   insights: ApiInsights | null;
   flatSpans: ApiSpan[];
   traceCost?: number | null;
+  traceInputTokens?: number | null;
+  traceOutputTokens?: number | null;
   onHighlightNode: (id: string | null) => void;
 }) {
   if (!trace) return null;
@@ -1817,8 +1889,20 @@ function TraceOverviewPane({ trace, insights, flatSpans, traceCost, onHighlightN
           {[
             { label: "Latency", value: fmtMs(resolvedLatency) },
             { label: "Cost", value: fmtCost(resolvedCost) },
-            { label: "In Tokens", value: trace.input_tokens != null ? trace.input_tokens.toLocaleString() : "N/A" },
-            { label: "Out Tokens", value: trace.output_tokens != null ? trace.output_tokens.toLocaleString() : "N/A" },
+            {
+              label: "In Tokens",
+              value:
+                traceInputTokens != null
+                  ? traceInputTokens.toLocaleString()
+                  : "N/A",
+            },
+            {
+              label: "Out Tokens",
+              value:
+                traceOutputTokens != null
+                  ? traceOutputTokens.toLocaleString()
+                  : "N/A",
+            },
           ].map(({ label, value }) => (
             <div key={label} className="bg-cp-elevated rounded-lg p-3 border border-cp-border">
               <div className="text-xs text-cp-muted mb-1">{label}</div>
@@ -2024,65 +2108,131 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   }, [sessionTraces, runDurations]);
 
   useEffect(() => {
+    let cancelled = false;
+    let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
     setLoading(true);
     setError(null);
     setSelectedNodeId(null);
     setHighlightedNodeId(null);
 
-    Promise.all([
-      apiGet<ApiTraceDetail>(`/traces/${traceId}`),
-      apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
-    ]).then(([d, ins]) => {
-      // The trace endpoint is the source of truth for per-span input/output.
-      // Enrich graph nodes before layout so clicking a graph node always has
-      // the same payload as the corresponding persisted span.
-      const persisted = flattenSpans(d.spans || []);
+    const loadTrace = async (showLoading = false) => {
+      if (showLoading) setLoading(true);
 
-      const enrichedGraph = d.graph
-        ? {
-            ...d.graph,
-            nodes: (d.graph.nodes || []).map(g => {
-              const span = resolveSpanForGraphNode(g, persisted);
+      try {
+        const [d, ins, freshTraces] = await Promise.all([
+          apiGet<ApiTraceDetail>(`/traces/${traceId}`),
+          apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
+          apiGet<ApiTrace[]>("/traces?limit=500").catch(() => []),
+        ]);
 
-              return {
-                ...g,
-                input: g.input ?? span?.input ?? null,
-                output: g.output ?? span?.output ?? null,
-                context: g.context ?? span?.context ?? null,
-                parent_span_id: g.parent_span_id ?? span?.parent_span_id ?? null,
-              };
-            }),
-          }
-        : d.graph;
+        if (cancelled) return;
 
-      setDetail({
-        ...d,
-        graph: enrichedGraph,
-      });
-      setInsights(ins);
-    }).catch(err => setError(err.message))
-      .finally(() => setLoading(false));
+        // The trace endpoint is the source of truth for the currently selected
+        // workflow. Rebuild the graph from the latest persisted spans every
+        // refresh so a RUNNING workflow can progressively show new spans.
+        const persisted = flattenSpans(d.spans || []);
+
+        const enrichedGraph = d.graph
+          ? {
+              ...d.graph,
+              nodes: (d.graph.nodes || []).map(g => {
+                const span = resolveSpanForGraphNode(g, persisted);
+
+                return {
+                  ...g,
+                  input: g.input ?? span?.input ?? null,
+                  output: g.output ?? span?.output ?? null,
+                  context: g.context ?? span?.context ?? null,
+                  parent_span_id: g.parent_span_id ?? span?.parent_span_id ?? null,
+                };
+              }),
+            }
+          : d.graph;
+
+        setDetail({
+          ...d,
+          graph: enrichedGraph,
+        });
+        setInsights(ins);
+        setAllTraces(freshTraces);
+
+        // Once the backend says the workflow is no longer running, one final
+        // refresh is enough. While it is running, keep polling so child LLM
+        // traces and their token/cost data appear without reopening the run.
+        if (d.trace?.status !== "running" && refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+      } catch (err: any) {
+        if (!cancelled) setError(err?.message || "Failed to load trace");
+      } finally {
+        if (!cancelled && showLoading) setLoading(false);
+      }
+    };
+
+    loadTrace(true);
+
+    // This is the important live-run fix. Previously this page fetched the
+    // trace once, so a RUNNING workflow stayed frozen at whatever data existed
+    // at the moment it was opened. The OpenAI child trace may be created later,
+    // which is why completed runs showed tokens/cost while running runs showed
+    // only latency.
+    refreshTimer = setInterval(() => {
+      loadTrace(false);
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      if (refreshTimer) clearInterval(refreshTimer);
+    };
   }, [traceId]);
 
   const flatSpans = detail ? flattenSpans(detail.spans) : [];
   const { nodes, edges } = layoutGraph(detail);
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) ?? null : null;
-  const currentTrace = sessionTraces.find(t => t.id === traceId) ?? detail?.trace ?? null;
+  // GET /traces is the live workflow snapshot and already enriches root
+  // workflow rows with child LLM usage. Prefer that snapshot over the initial
+  // session list or the detail endpoint for the overview metrics.
+  const liveRootTrace = allTraces.find(t => t.id === traceId) ?? null;
+
+  const currentTrace = liveRootTrace
+    ? {
+        ...(detail?.trace ?? {}),
+        ...liveRootTrace,
+      } as ApiTrace
+    : detail?.trace
+      ?? sessionTraces.find(t => t.id === traceId)
+      ?? null;
+
   const factScore = currentTrace?.factuality_score;
 
   const currentRunDuration = currentTrace && detail
     ? getResolvedRunDuration(currentTrace, detail.spans || [], insights)
     : currentTrace?.latency_ms ?? null;
-  const childTraceCost = currentTrace
-    ? getChildTraceCost(allTraces, currentTrace.id)
-    : null;
+
+  const childTraceMetrics = currentTrace
+    ? getChildTraceMetrics(allTraces, currentTrace.id)
+    : {
+        inputTokens: null,
+        outputTokens: null,
+        cost: null,
+      };
+
+  const currentRunInputTokens =
+    currentTrace?.input_tokens != null && currentTrace.input_tokens > 0
+      ? currentTrace.input_tokens
+      : childTraceMetrics.inputTokens;
+
+  const currentRunOutputTokens =
+    currentTrace?.output_tokens != null && currentTrace.output_tokens > 0
+      ? currentTrace.output_tokens
+      : childTraceMetrics.outputTokens;
 
   const currentRunCost =
-    childTraceCost != null && childTraceCost > 0
-      ? childTraceCost
-      : currentTrace
-        ? getResolvedRunCost(currentTrace, detail?.spans || [], insights)
-        : null;
+    currentTrace?.estimated_cost_usd != null && currentTrace.estimated_cost_usd > 0
+      ? currentTrace.estimated_cost_usd
+      : childTraceMetrics.cost;
 
   return (
     <div className="flex flex-col h-screen bg-cp-app">
@@ -2202,6 +2352,8 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
               flatSpans={flatSpans}
               insights={insights}
               traceCost={currentRunCost}
+              traceInputTokens={currentRunInputTokens}
+              traceOutputTokens={currentRunOutputTokens}
               onHighlightNode={setHighlightedNodeId}
             />
           )}

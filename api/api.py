@@ -348,6 +348,74 @@ def update_trace(
                     detail="Trace not found.",
                 )
 
+            # --------------------------------------------------------
+            # PLATFORM-LEVEL FAILURE PROPAGATION
+            # --------------------------------------------------------
+            # If any trace belonging to a workflow fails, ControlPlane
+            # automatically closes the workflow root as ERROR. SDKs and
+            # applications therefore do not need custom failure cleanup.
+            if update.status == "error":
+                cursor.execute(
+                    """
+                    SELECT parent_trace_id
+                    FROM traces
+                    WHERE id = %s
+                    """,
+                    (trace_id,),
+                )
+
+                row = cursor.fetchone()
+                parent_trace_id = row[0] if row else None
+
+                # Walk up the trace ancestry. This handles direct child
+                # traces as well as nested traces.
+                current_parent_id = parent_trace_id
+                visited = set()
+
+                while current_parent_id and str(current_parent_id) not in visited:
+                    visited.add(str(current_parent_id))
+
+                    cursor.execute(
+                        """
+                        UPDATE traces
+                        SET
+                            status = 'error',
+                            ended_at = COALESCE(
+                                ended_at,
+                                NOW()
+                            ),
+                            latency_ms = COALESCE(
+                                latency_ms,
+                                CASE
+                                    WHEN started_at IS NOT NULL
+                                    THEN EXTRACT(
+                                        EPOCH FROM (NOW() - started_at)
+                                    ) * 1000
+                                    ELSE 0
+                                END
+                            )
+                        WHERE id = %s
+                          AND status IN ('pending', 'running')
+                        """,
+                        (current_parent_id,),
+                    )
+
+                    cursor.execute(
+                        """
+                        SELECT parent_trace_id
+                        FROM traces
+                        WHERE id = %s
+                        """,
+                        (current_parent_id,),
+                    )
+
+                    parent_row = cursor.fetchone()
+                    current_parent_id = (
+                        parent_row[0]
+                        if parent_row
+                        else None
+                    )
+
     return {
         "id": trace_id,
         "status": "updated",
@@ -514,6 +582,25 @@ def get_trace(trace_id: str):
                     detail="Trace not found.",
                 )
 
+            # Enrich workflow traces with live usage from child traces.
+            # Child LLM/Shadow traces hold the actual token and cost values,
+            # while the workflow/root trace may still be running and therefore
+            # have NULL/0 usage of its own. This mirrors the aggregation used
+            # by GET /traces so the single-trace endpoint exposes the same data.
+            cursor.execute(
+                """
+                SELECT
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(estimated_cost_usd), 0)
+                FROM traces
+                WHERE parent_trace_id = %s
+                """,
+                (trace_id,),
+            )
+
+            child_usage_row = cursor.fetchone()
+
             cursor.execute(
                 """
                 SELECT
@@ -584,8 +671,26 @@ def get_trace(trace_id: str):
         else:
             roots.append(span)
 
+    trace = trace_to_dict(trace_row)
+
+    # Only fill missing workflow usage from children. If the workflow already
+    # has a non-zero value, preserve it as the authoritative value.
+    if child_usage_row:
+        child_input_tokens = child_usage_row[0] or 0
+        child_output_tokens = child_usage_row[1] or 0
+        child_cost = float(child_usage_row[2] or 0)
+
+        if not trace["input_tokens"] and child_input_tokens > 0:
+            trace["input_tokens"] = child_input_tokens
+
+        if not trace["output_tokens"] and child_output_tokens > 0:
+            trace["output_tokens"] = child_output_tokens
+
+        if not trace["estimated_cost_usd"] and child_cost > 0:
+            trace["estimated_cost_usd"] = child_cost
+
     return {
-        "trace": trace_to_dict(trace_row),
+        "trace": trace,
         "spans": roots,
     }
 
@@ -689,6 +794,100 @@ def create_span(span: SpanCreate):
                     ),
                 ),
             )
+
+            # --------------------------------------------------------
+            # PLATFORM-LEVEL SPAN FAILURE ENFORCEMENT
+            # --------------------------------------------------------
+            # A failed span means the workflow did not complete
+            # successfully. Close the owning trace immediately.
+            if span.status == "error":
+                cursor.execute(
+                    """
+                    UPDATE traces
+                    SET
+                        status = 'error',
+                        ended_at = COALESCE(
+                            ended_at,
+                            NOW()
+                        ),
+                        latency_ms = COALESCE(
+                            latency_ms,
+                            CASE
+                                WHEN started_at IS NOT NULL
+                                THEN EXTRACT(
+                                    EPOCH FROM (NOW() - started_at)
+                                ) * 1000
+                                ELSE 0
+                            END
+                        )
+                    WHERE id = %s
+                      AND status IN ('pending', 'running')
+                    """,
+                    (span.trace_id,),
+                )
+
+                # If this trace is itself a child trace, propagate the
+                # failure through its trace parents as well.
+                current_parent_id = None
+
+                cursor.execute(
+                    """
+                    SELECT parent_trace_id
+                    FROM traces
+                    WHERE id = %s
+                    """,
+                    (span.trace_id,),
+                )
+
+                parent_row = cursor.fetchone()
+                if parent_row:
+                    current_parent_id = parent_row[0]
+
+                visited = set()
+
+                while current_parent_id and str(current_parent_id) not in visited:
+                    visited.add(str(current_parent_id))
+
+                    cursor.execute(
+                        """
+                        UPDATE traces
+                        SET
+                            status = 'error',
+                            ended_at = COALESCE(
+                                ended_at,
+                                NOW()
+                            ),
+                            latency_ms = COALESCE(
+                                latency_ms,
+                                CASE
+                                    WHEN started_at IS NOT NULL
+                                    THEN EXTRACT(
+                                        EPOCH FROM (NOW() - started_at)
+                                    ) * 1000
+                                    ELSE 0
+                                END
+                            )
+                        WHERE id = %s
+                          AND status IN ('pending', 'running')
+                        """,
+                        (current_parent_id,),
+                    )
+
+                    cursor.execute(
+                        """
+                        SELECT parent_trace_id
+                        FROM traces
+                        WHERE id = %s
+                        """,
+                        (current_parent_id,),
+                    )
+
+                    parent_row = cursor.fetchone()
+                    current_parent_id = (
+                        parent_row[0]
+                        if parent_row
+                        else None
+                    )
 
     return {
         "id": span.span_id,
