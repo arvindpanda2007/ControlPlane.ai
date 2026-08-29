@@ -583,7 +583,70 @@ function groupTracesBySession(allTraces: ApiTrace[]): AppGroup[] {
       total: childTraces.length,
     };
 
-    const sorted = [...rootTraces].sort(
+    // In Default / All Traces, the selected workflow run is a root trace,
+    // while token usage and cost can live on its child traces. Attach those
+    // child totals to the corresponding root before the workspace receives it.
+    const childTotals = new Map<string, {
+      input: number;
+      output: number;
+      cost: number;
+      hasInput: boolean;
+      hasOutput: boolean;
+      hasCost: boolean;
+    }>();
+
+    for (const child of childTraces) {
+      if (!child.parent_trace_id) continue;
+
+      const totals = childTotals.get(child.parent_trace_id) || {
+        input: 0,
+        output: 0,
+        cost: 0,
+        hasInput: false,
+        hasOutput: false,
+        hasCost: false,
+      };
+
+      if (child.input_tokens != null && child.input_tokens > 0) {
+        totals.input += child.input_tokens;
+        totals.hasInput = true;
+      }
+
+      if (child.output_tokens != null && child.output_tokens > 0) {
+        totals.output += child.output_tokens;
+        totals.hasOutput = true;
+      }
+
+      if (child.estimated_cost_usd != null && child.estimated_cost_usd > 0) {
+        totals.cost += child.estimated_cost_usd;
+        totals.hasCost = true;
+      }
+
+      childTotals.set(child.parent_trace_id, totals);
+    }
+
+    const enrichedRootTraces = rootTraces.map(trace => {
+      const totals = childTotals.get(trace.id);
+      if (!totals) return trace;
+
+      return {
+        ...trace,
+        input_tokens:
+          trace.input_tokens != null && trace.input_tokens > 0
+            ? trace.input_tokens
+            : totals.hasInput ? totals.input : trace.input_tokens,
+        output_tokens:
+          trace.output_tokens != null && trace.output_tokens > 0
+            ? trace.output_tokens
+            : totals.hasOutput ? totals.output : trace.output_tokens,
+        estimated_cost_usd:
+          trace.estimated_cost_usd != null && trace.estimated_cost_usd > 0
+            ? trace.estimated_cost_usd
+            : totals.hasCost ? totals.cost : trace.estimated_cost_usd,
+      };
+    });
+
+    const sorted = [...enrichedRootTraces].sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
     const lastActivity = sorted[0]?.created_at || null;
@@ -2004,7 +2067,7 @@ function TraceInvestigation({ traceId, sessionTraces, onSelectTrace, onBack }: T
   const flatSpans = detail ? flattenSpans(detail.spans) : [];
   const { nodes, edges } = layoutGraph(detail);
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) ?? null : null;
-  const currentTrace = detail?.trace ?? sessionTraces.find(t => t.id === traceId) ?? null;
+  const currentTrace = sessionTraces.find(t => t.id === traceId) ?? detail?.trace ?? null;
   const factScore = currentTrace?.factuality_score;
 
   const currentRunDuration = currentTrace && detail

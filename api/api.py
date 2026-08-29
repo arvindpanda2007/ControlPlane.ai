@@ -412,10 +412,62 @@ def get_traces(
 
             rows = cursor.fetchall()
 
-    return [
-        trace_to_dict(row)
-        for row in rows
-    ]
+            # Enrich only workflow/root traces in the global trace list.
+            # This does not write anything to the database and does not alter
+            # the project/session endpoints or trace lifecycle.
+            workflow_ids = [
+                row[0]
+                for row in rows
+                if row[2] == "controlplane"
+                and row[3] == "workflow"
+            ]
+
+            child_usage = {}
+
+            if workflow_ids:
+                cursor.execute(
+                    """
+                    SELECT
+                        parent_trace_id,
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(estimated_cost_usd), 0)
+                    FROM traces
+                    WHERE parent_trace_id = ANY(%s)
+                    GROUP BY parent_trace_id
+                    """,
+                    (workflow_ids,),
+                )
+
+                for parent_id, input_tokens, output_tokens, cost in cursor.fetchall():
+                    child_usage[parent_id] = {
+                        "input_tokens": input_tokens or 0,
+                        "output_tokens": output_tokens or 0,
+                        "estimated_cost_usd": float(cost or 0),
+                    }
+
+    result = []
+
+    for row in rows:
+        trace = trace_to_dict(row)
+        usage = child_usage.get(row[0])
+
+        if usage:
+            if not trace["input_tokens"] and usage["input_tokens"] > 0:
+                trace["input_tokens"] = usage["input_tokens"]
+
+            if not trace["output_tokens"] and usage["output_tokens"] > 0:
+                trace["output_tokens"] = usage["output_tokens"]
+
+            if (
+                not trace["estimated_cost_usd"]
+                and usage["estimated_cost_usd"] > 0
+            ):
+                trace["estimated_cost_usd"] = usage["estimated_cost_usd"]
+
+        result.append(trace)
+
+    return result
 
 
 # ============================================================
