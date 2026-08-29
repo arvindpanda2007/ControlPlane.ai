@@ -193,6 +193,17 @@ def create_trace(trace: TraceCreate):
         "trace ID",
     )
 
+    if not trace.session_id or not trace.session_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Project is required. "
+                "This workflow cannot be recorded because no "
+                "session_id was provided. "
+                "Please assign this workflow to a project."
+            ),
+        )
+
     if trace.parent_trace_id:
         validate_uuid(
             trace.parent_trace_id,

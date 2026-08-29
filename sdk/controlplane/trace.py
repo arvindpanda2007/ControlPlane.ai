@@ -140,6 +140,25 @@ class Trace:
         name: str,
         session_id: str | None = None,
     ):
+        # -----------------------------------------------------
+        # PROJECT / SESSION ENFORCEMENT
+        #
+        # Every workflow must belong to a project/session.
+        #
+        # Interactive callers are handled by
+        # ControlPlane.start_trace(), which asks the developer
+        # for the session ID before constructing this object.
+        #
+        # This check is the final SDK-level safety net so that
+        # Trace objects cannot silently exist without a project.
+        # -----------------------------------------------------
+
+        if not session_id or not session_id.strip():
+            raise ValueError(
+                "session_id is required. "
+                "Every workflow must belong to a project."
+            )
+
         self.controlplane = controlplane
 
         # -----------------------------------------------------
@@ -149,7 +168,7 @@ class Trace:
         self.id = str(uuid.uuid4())
 
         self.name = name
-        self.session_id = session_id
+        self.session_id = session_id.strip()
 
         # -----------------------------------------------------
         # WORKFLOW LIFECYCLE

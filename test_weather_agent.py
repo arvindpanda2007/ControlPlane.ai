@@ -1,10 +1,15 @@
 import asyncio
 import uuid
+import time
 from datetime import datetime, timezone
-
+from dotenv import load_dotenv
 import httpx
 import requests
 
+from sdk.controlplane.client import ControlPlane
+from sdk.controlplane.openai import OpenAIClient
+
+load_dotenv()
 
 # ============================================================
 # CONFIG
@@ -46,25 +51,6 @@ def get_json(path):
     )
     r.raise_for_status()
     return r.json()
-
-
-def create_trace(trace_id, prompt, context):
-    return post_json(
-        "/traces",
-        {
-            "id": trace_id,
-            "provider": "weather-agent",
-            "model": "weather-agent-v1",
-            "input": prompt,
-            "output": None,
-            "context": context,
-            "status": "running",
-            "latency_ms": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "estimated_cost_usd": 0,
-        },
-    )
 
 
 def create_span(
@@ -391,8 +377,17 @@ def validate_spans(trace_id, trace_detail, expected_names):
 # ============================================================
 
 async def main():
-    trace_id = new_id()
+    controlplane = ControlPlane(CONTROLPLANE)
+    openai_client = OpenAIClient(controlplane=controlplane)
 
+    # ControlPlane owns project/session enforcement and creates the
+    # canonical workflow trace before execution starts.
+    workflow_trace = controlplane.start_trace(
+        "Weather Agent"
+    )
+
+    session_id = workflow_trace.session_id
+    trace_id = workflow_trace.id
     prompt = (
         f"Should I go running outside in {LOCATION} today? "
         "Check the weather and air quality and give me a recommendation."
@@ -416,7 +411,12 @@ async def main():
     # --------------------------------------------------------
 
     print("[1] Creating trace...")
-    create_trace(trace_id, prompt, context)
+    print(f"Project/session ID: {session_id}")
+    print(f"Trace ID: {trace_id}")
+
+    # The workflow trace was created synchronously by start_trace().
+    # Entering it records the running lifecycle state.
+    workflow_trace.__enter__()
 
     # --------------------------------------------------------
     # 2. PARSE
@@ -757,7 +757,7 @@ async def main():
     # 7. RECOMMENDATION
     # --------------------------------------------------------
 
-    print("[7] Generating recommendation...")
+    print("[7] Generating recommendation with OpenAI...")
 
     recommendation_input = {
         "weather": weather_output,
@@ -766,9 +766,60 @@ async def main():
         "safety_check": branch_output,
     }
 
+    recommendation_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the recommendation agent for a weather "
+                "activity workflow. Give a concise recommendation "
+                "about whether the user should run outside. Use "
+                "the supplied weather, air quality, analysis, and "
+                "safety check. Do not invent measurements."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"User question: {prompt}\n\n"
+                f"Weather: {weather_output}\n"
+                f"Air quality: {air_output}\n"
+                f"Analysis: {analysis_output}\n"
+                f"Safety check: {branch_output}"
+            ),
+        },
+    ]
+
+    recommendation_started = time.perf_counter()
+
+    # This is the real LLM call. OpenAIClient is responsible for
+    # response usage, cost calculation, safety checks, and creation
+    # of the OpenAI child trace linked to this workflow trace.
+    llm_response = await asyncio.to_thread(
+        openai_client.chat,
+        model="gpt-4.1-mini",
+        messages=recommendation_messages,
+        context=context,
+        session_id=session_id,
+        trace=workflow_trace,
+    )
+
+    recommendation_duration_ms = int(
+        (time.perf_counter() - recommendation_started) * 1000
+    )
+
+    llm_recommendation = (
+        llm_response.choices[0].message.content or ""
+    ).strip()
+
+    if not llm_recommendation:
+        raise RuntimeError(
+            "OpenAI returned an empty recommendation."
+        )
+
     recommendation_output = {
         "should_run": branch_output["severity"] == "low",
-        "recommendation": branch_output["recommendation"],
+        "recommendation": llm_recommendation,
+        "rule_based_safety": branch_output["recommendation"],
     }
 
     recommendation_span = create_span(
@@ -778,7 +829,12 @@ async def main():
         recommendation_input,
         recommendation_output,
         parent=branch_span,
-        duration_ms=500,
+        duration_ms=recommendation_duration_ms,
+        metadata={
+            "llm": True,
+            "model": "gpt-4.1-mini",
+            "session_id": session_id,
+        },
     )
 
     # --------------------------------------------------------
@@ -800,7 +856,7 @@ async def main():
         f"{rain} mm rain, "
         f"{wind} km/h wind. "
         f"Air quality AQI: {aqi}. "
-        f"{branch_output['recommendation']}"
+        f"{llm_recommendation}"
     )
 
     final_span = create_span(
@@ -859,6 +915,12 @@ async def main():
         parent=logging_span,
         duration_ms=80,
     )
+
+    # Finish the canonical workflow trace and wait for all SDK
+    # telemetry. This includes the real OpenAI child trace and its
+    # usage/cost metadata before we read the run back from the API.
+    workflow_trace.__exit__(None, None, None)
+    controlplane.flush()
 
     # --------------------------------------------------------
     # 10. READ BACK THE TRACE AND CHECK IT

@@ -27,6 +27,47 @@ class ControlPlane:
         name: str,
         session_id: str | None = None,
     ):
+        # -----------------------------------------------------
+        # PROJECT / SESSION ID
+        #
+        # If a developer runs a workflow interactively without
+        # providing a project/session ID, ask for it in CMD.
+        #
+        # Non-interactive environments (CI, Docker, services)
+        # must provide session_id explicitly so they never hang
+        # waiting for input.
+        # -----------------------------------------------------
+
+        if not session_id or not session_id.strip():
+            import sys
+
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                print()
+                print(
+                    "ControlPlane: This workflow must belong "
+                    "to a project."
+                )
+                print(
+                    "Please enter a project/session ID."
+                )
+
+                session_id = input(
+                    "Session ID: "
+                ).strip()
+
+                if not session_id:
+                    raise ValueError(
+                        "A session ID is required. "
+                        "Every workflow must belong to a project."
+                    )
+            else:
+                raise ValueError(
+                    "session_id is required. "
+                    "Every workflow must belong to a project. "
+                    "Provide session_id when running in a "
+                    "non-interactive environment."
+                )
+
         from .trace import Trace
 
         trace = Trace(
@@ -57,7 +98,7 @@ class ControlPlane:
         *,
         trace_id: str,
         name: str,
-        session_id: str | None,
+        session_id: str,
     ):
         payload = {
             "id": trace_id,
@@ -199,13 +240,19 @@ class ControlPlane:
         latency_ms: int | None = None,
         estimated_cost_usd: float | None = None,
         context: str | None = None,
-        session_id: str | None = None,
+        session_id: str,
         status: str = "success",
         safety_flag: bool = False,
         safety_type: str | None = None,
         safety_action: str | None = None,
         parent_trace_id: str | None = None,
     ):
+        if not session_id or not session_id.strip():
+            raise ValueError(
+                "session_id is required. "
+                "Every trace must belong to a project."
+            )
+
         trace_id = str(uuid.uuid4())
 
         payload = {
