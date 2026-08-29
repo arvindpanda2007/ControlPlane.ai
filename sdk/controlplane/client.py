@@ -1,20 +1,245 @@
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
-import uuid
+from datetime import datetime, timezone
+from typing import Any
+
 import httpx
+import json
+
+
+def _serialize_context(value):
+    if value is None or isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+class Span:
+    """Opaque developer-facing span handle.
+
+    Developers may pass a Span returned by run.span(...) as the parent of
+    another span, but they never provide or generate its ID.
+    """
+
+    def __init__(self, run: "Run", span_id: str, name: str):
+        self._run = run
+        self._id = str(span_id)
+        self.name = name
+
+    @property
+    def id(self):
+        # Intentionally private to normal application code.
+        return self._id
+
+    def __repr__(self):
+        return f"Span(name={self.name!r})"
+
+
+class Run:
+    """
+    Public application-run handle.
+
+    Developer contract:
+
+        app = cp.application("Weather Agent", session_id="messi")
+
+        with app.run(input="...", context={...}) as run:
+            root = run.span(...)
+            child = run.span(..., parent=root)
+
+    The developer never supplies application IDs, run IDs, trace IDs,
+    span IDs, or parent ID strings. ControlPlane owns all identifiers.
+    """
+
+    def __init__(
+        self,
+        controlplane: "ControlPlane",
+        application_id: str,
+        run_id: str,
+        application_name: str,
+        session_id: str,
+        input: Any = None,
+        context: Any = None,
+    ):
+        self._controlplane = controlplane
+        self._application_id = str(application_id)
+        self._run_id = str(run_id)
+        self._application_name = application_name
+        self._session_id = session_id
+        self._input = input
+        self._context = context
+
+        self._trace_id: str | None = None
+        self._started_at: str | None = None
+        self._ended_at: str | None = None
+        self._closed = False
+
+    @property
+    def id(self):
+        """Server-created run identifier."""
+        return self._run_id
+
+    @property
+    def application_id(self):
+        """Server-created application identifier."""
+        return self._application_id
+
+    def __enter__(self):
+        self._started_at = datetime.now(timezone.utc).isoformat()
+
+        data = self._controlplane._create_run_trace(
+            run_id=self._run_id,
+            application_name=self._application_name,
+            session_id=self._session_id,
+            input=self._input,
+            context=self._context,
+        )
+
+        trace_id = data.get("trace_id") or data.get("id")
+        if not trace_id:
+            raise RuntimeError(
+                "ControlPlane did not return the internal run trace ID."
+            )
+
+        self._trace_id = str(trace_id)
+
+        self._controlplane._update_run(
+            self._run_id,
+            started_at=self._started_at,
+            status="running",
+        )
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._ended_at = datetime.now(timezone.utc).isoformat()
+
+        status = "error" if exc is not None else "success"
+
+        if self._trace_id:
+            started = self._started_at
+            latency_ms = None
+
+            if started:
+                try:
+                    start_dt = datetime.fromisoformat(started)
+                    end_dt = datetime.fromisoformat(self._ended_at)
+                    latency_ms = max(
+                        0,
+                        int((end_dt - start_dt).total_seconds() * 1000),
+                    )
+                except Exception:
+                    latency_ms = None
+
+            self._controlplane._update_run(
+                self._run_id,
+                ended_at=self._ended_at,
+                latency_ms=latency_ms,
+                status=status,
+            )
+
+        self._closed = True
+        return False
+
+    def span(
+        self,
+        name: str,
+        span_type: str,
+        input_data: Any = None,
+        output_data: Any = None,
+        *,
+        parent: Span | None = None,
+        duration_ms: int | None = None,
+        status: str = "success",
+        metadata: dict | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+    ) -> Span:
+        """
+        Record a span inside this run.
+
+        `parent` accepts a Span handle, never a parent span ID.
+        ControlPlane generates the actual span ID.
+        """
+        if self._trace_id is None:
+            raise RuntimeError(
+                "Run must be entered with 'with app.run(...) as run:' "
+                "before recording spans."
+            )
+
+        parent_id = parent._id if parent is not None else None
+
+        data = self._controlplane._create_span(
+            trace_id=self._trace_id,
+            parent_span_id=parent_id,
+            name=name,
+            span_type=span_type,
+            input_data=input_data,
+            output_data=output_data,
+            duration_ms=duration_ms,
+            status=status,
+            metadata=metadata,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+
+        span_id = data.get("span_id") or data.get("id")
+        if not span_id:
+            raise RuntimeError(
+                f"ControlPlane did not return a span ID for {name!r}."
+            )
+
+        return Span(self, span_id, name)
+
+    def error_span(
+        self,
+        name: str,
+        span_type: str,
+        input_data: Any,
+        exc: Exception,
+        *,
+        parent: Span | None = None,
+        metadata: dict | None = None,
+    ) -> Span:
+        merged = {
+            **(metadata or {}),
+            "error_type": type(exc).__name__,
+        }
+
+        return self.span(
+            name=name,
+            span_type=span_type,
+            input_data=input_data,
+            output_data={"error": str(exc)},
+            parent=parent,
+            duration_ms=0,
+            status="error",
+            metadata=merged,
+        )
+
+    # ---------------------------------------------------------
+    # Internal/test-only readback.
+    # ---------------------------------------------------------
+
+    def _get_spans(self):
+        if self._trace_id is None:
+            raise RuntimeError("Run has not started.")
+
+        response = self._controlplane._get(
+            f"/traces/{self._trace_id}/spans"
+        )
+        return response
 
 
 class Application:
     """
     Public ControlPlane application.
 
-    Developers name the application once. ControlPlane owns each run ID.
-
-    Public usage:
-
-        app = cp.application("Weather Agent", session_id="messi")
-
-        with app.run() as run:
-            ...
+    The developer names the application once. ControlPlane owns every
+    application, run, trace, and span identifier.
     """
 
     def __init__(
@@ -26,22 +251,19 @@ class Application:
         name = name.strip()
 
         if not name:
-            raise ValueError(
-                "Application name is required."
-            )
+            raise ValueError("Application name is required.")
 
-        self.controlplane = controlplane
+        self._controlplane = controlplane
         self.name = name
         self.session_id = session_id.strip() if session_id else None
+        self._application_id: str | None = None
 
-    def run(self):
-        """
-        Create a new ControlPlane-managed workflow run.
-
-        The application supplies only the application name and optional
-        project/session ID. The run/trace ID is generated internally by
-        the Trace object.
-        """
+    def run(
+        self,
+        *,
+        input: Any = None,
+        context: Any = None,
+    ) -> Run:
         session_id = self.session_id
 
         if not session_id:
@@ -51,79 +273,70 @@ class Application:
                 print()
                 print("ControlPlane application setup")
                 print("-" * 70)
-
-                session_id = input(
-                    "Project/session ID: "
-                ).strip()
+                session_id = input("Project/session ID: ").strip()
 
                 if not session_id:
                     raise ValueError(
-                        "A project/session ID is required to run this application."
+                        "A project/session ID is required."
                     )
 
                 self.session_id = session_id
             else:
                 raise ValueError(
-                    "session_id is required. "
-                    "Every application run must belong to a project. "
-                    "Provide session_id when running in a "
-                    "non-interactive environment."
+                    "session_id is required. Provide session_id when "
+                    "running in a non-interactive environment."
                 )
 
-        from .trace import Trace
+        if self._application_id is None:
+            self._application_id = self._controlplane._create_application(
+                name=self.name,
+                session_id=session_id,
+            )
 
-        run = Trace(
-            controlplane=self.controlplane,
-            name=self.name,
-            session_id=session_id,
+        run_id = self._controlplane._create_run(
+            application_id=self._application_id,
+            input=input,
+            context=context,
         )
 
-        # The SDK creates the canonical workflow/run record before the
-        # context manager marks it as running.
-        self.controlplane._create_workflow_trace(
-            trace_id=run.id,
-            name=self.name,
+        return Run(
+            controlplane=self._controlplane,
+            application_id=self._application_id,
+            run_id=run_id,
+            application_name=self.name,
             session_id=session_id,
+            input=input,
+            context=context,
         )
-
-        return run
 
     def __repr__(self):
-        return (
-            f"Application(name={self.name!r}, "
-            f"session_id={self.session_id!r})"
-        )
+        return f"Application(name={self.name!r})"
 
 
 class ControlPlane:
+    """
+    Public SDK entry point.
+
+    Intentional public surface:
+
+        cp.application("My Application", session_id="project")
+
+    Low-level ID-based telemetry methods are private so application
+    developers cannot choose trace/span identifiers.
+    """
+
     def __init__(
         self,
         api_url: str = "http://127.0.0.1:8000",
     ):
         self.api_url = api_url.rstrip("/")
-
-        self._executor = ThreadPoolExecutor(
-            max_workers=4
-        )
-
-        # Shadow worker is created lazily.
-        self._shadow_worker = None
-
-    # =========================================================
-    # APPLICATIONS
-    # =========================================================
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def application(
         self,
         name: str,
         session_id: str | None = None,
     ) -> Application:
-        """
-        Create a named application handle.
-
-        The application name belongs to the developer. Individual run IDs
-        are generated by ControlPlane when app.run() / start_trace() is used.
-        """
         return Application(
             controlplane=self,
             name=name,
@@ -131,388 +344,162 @@ class ControlPlane:
         )
 
     # =========================================================
-    # WORKFLOW CREATION (INTERNAL)
+    # INTERNAL APPLICATION / RUN API
     # =========================================================
 
-    def _create_workflow_trace(
+    def _post(self, path: str, payload: dict):
+        response = httpx.post(
+            f"{self.api_url}{path}",
+            json=payload,
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+    def _get(self, path: str):
+        response = httpx.get(
+            f"{self.api_url}{path}",
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _patch(self, path: str, payload: dict):
+        response = httpx.patch(
+            f"{self.api_url}{path}",
+            json=payload,
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+    def _create_application(self, *, name: str, session_id: str) -> str:
+        data = self._post(
+            "/applications",
+            {
+                "name": name,
+                "session_id": session_id,
+            },
+        )
+
+        application_id = data.get("application_id") or data.get("id")
+        if not application_id:
+            raise RuntimeError(
+                "ControlPlane did not return an application ID."
+            )
+
+        return str(application_id)
+
+    def _create_run(
         self,
         *,
-        trace_id: str,
-        name: str,
+        application_id: str,
+        input: Any = None,
+        context: Any = None,
+    ) -> str:
+        data = self._post(
+            f"/applications/{application_id}/runs",
+            {
+                "input": (
+                    input
+                    if input is None or isinstance(input, str)
+                    else str(input)
+                ),
+                "context": _serialize_context(context),
+            },
+        )
+
+        run_id = data.get("run_id") or data.get("id")
+        if not run_id:
+            raise RuntimeError(
+                "ControlPlane did not return a run ID."
+            )
+
+        return str(run_id)
+
+    def _create_run_trace(
+        self,
+        *,
+        run_id: str,
+        application_name: str,
         session_id: str,
+        input: Any,
+        context: Any,
     ):
-        payload = {
-            "id": trace_id,
-            "provider": "controlplane",
-            "model": "workflow",
+        # No trace ID is supplied. The API creates it.
+        return self._post(
+            f"/runs/{run_id}/traces",
+            {
+                "provider": "controlplane",
+                "model": "workflow",
+                "input": str(input) if input is not None else application_name,
+                "output": None,
+                "context": _serialize_context(context),
+                "session_id": session_id,
+                "status": "pending",
+            },
+        )
 
-            "input": name,
-            "output": None,
-
-            "input_tokens": None,
-            "output_tokens": None,
-
-            "latency_ms": None,
-
-            "estimated_cost_usd": None,
-
-            "context": None,
-
-            "session_id": session_id,
-
-            "status": "pending",
-
-            "safety_flag": False,
-            "safety_type": None,
-            "safety_action": None,
-
-            "parent_trace_id": None,
-
-            "started_at": None,
-            "ended_at": None,
-        }
-
-        # DO NOT QUEUE THIS.
-        #
-        # The workflow record must exist before lifecycle updates are
-        # sent by Trace.__enter__().
-        self._send_workflow_trace(payload)
-
-    def _send_workflow_trace(
+    def _update_run(
         self,
-        payload: dict,
-    ):
-        try:
-            response = httpx.post(
-                f"{self.api_url}/traces",
-                json=payload,
-                timeout=5.0,
-            )
-
-            response.raise_for_status()
-
-            print(
-                "WORKFLOW TRACE STORED:",
-                payload["id"],
-            )
-
-        except Exception as error:
-            print(
-                f"ControlPlane workflow trace failed: {error}"
-            )
-            raise
-
-    # =========================================================
-    # UPDATE WORKFLOW LIFECYCLE
-    # =========================================================
-
-    def update_trace(
-        self,
+        run_id: str,
         *,
-        trace_id: str,
         started_at: str | None = None,
         ended_at: str | None = None,
         latency_ms: int | None = None,
         status: str | None = None,
     ):
-        payload = {
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "latency_ms": latency_ms,
-            "status": status,
-        }
-
-        self._executor.submit(
-            self._send_trace_update,
-            trace_id,
-            payload,
+        self._patch(
+            f"/runs/{run_id}",
+            {
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "latency_ms": latency_ms,
+                "status": status,
+            },
         )
 
-    def _send_trace_update(
-        self,
-        trace_id: str,
-        payload: dict,
-    ):
-        try:
-            response = httpx.patch(
-                f"{self.api_url}/traces/{trace_id}",
-                json=payload,
-                timeout=5.0,
-            )
-
-            response.raise_for_status()
-
-            print(
-                "TRACE UPDATED:",
-                trace_id,
-                payload,
-            )
-
-        except Exception as error:
-            print(
-                f"ControlPlane trace update failed: {error}"
-            )
-
-    # =========================================================
-    # LLM TRACE
-    # =========================================================
-
-    def trace(
-        self,
-        *,
-        provider: str,
-        model: str,
-        input: str,
-        output: str | None = None,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        latency_ms: int | None = None,
-        estimated_cost_usd: float | None = None,
-        context: str | None = None,
-        session_id: str,
-        status: str = "success",
-        safety_flag: bool = False,
-        safety_type: str | None = None,
-        safety_action: str | None = None,
-        parent_trace_id: str | None = None,
-    ):
-        if not session_id or not session_id.strip():
-            raise ValueError(
-                "session_id is required. "
-                "Every trace must belong to a project."
-            )
-
-        trace_id = str(uuid.uuid4())
-
-        payload = {
-            "id": trace_id,
-
-            "provider": provider,
-            "model": model,
-
-            "input": input,
-            "output": output,
-
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-
-            "latency_ms": latency_ms,
-
-            "estimated_cost_usd": estimated_cost_usd,
-
-            "context": context,
-
-            "session_id": session_id,
-
-            "status": status,
-
-            "safety_flag": safety_flag,
-            "safety_type": safety_type,
-            "safety_action": safety_action,
-
-            "parent_trace_id": parent_trace_id,
-        }
-
-        # -----------------------------------------------------
-        # STORE LLM TRACE SYNCHRONOUSLY
-        #
-        # LLM usage (tokens/cost) and terminal errors must be
-        # visible to ControlPlane immediately. Keeping this write
-        # synchronous guarantees that the workflow API can expose
-        # the child trace as soon as the model call returns.
-        #
-        # Shadow evaluation is still dispatched asynchronously
-        # after the trace is persisted so it cannot delay the
-        # application response.
-        # -----------------------------------------------------
-
-        self._send_llm_trace(payload)
-
-        if (
-            payload["status"] == "success"
-            and payload["context"]
-            and payload["output"]
-        ):
-            self._executor.submit(
-                self._run_shadow_evaluation,
-                trace_id,
-            )
-
-        return trace_id
-
-    def _send_llm_trace(
-        self,
-        payload: dict,
-    ):
-        """
-        Persist the LLM trace immediately.
-
-        This is intentionally synchronous because the returned
-        token/cost data is part of the live workflow state and must
-        be available to the API/UI without waiting for the telemetry
-        executor queue.
-        """
-        try:
-            response = httpx.post(
-                f"{self.api_url}/traces",
-                json=payload,
-                timeout=5.0,
-            )
-
-            response.raise_for_status()
-
-            print(
-                "LLM TRACE STORED:",
-                payload["id"],
-            )
-
-        except Exception as error:
-            print(
-                f"ControlPlane trace failed: {error}"
-            )
-
-            # Trace persistence is part of the observability contract.
-            # Do not silently continue when the backend cannot store
-            # the LLM result.
-            raise
-
-    def _run_shadow_evaluation(
-        self,
-        trace_id: str,
-    ):
-        """
-        Run Shadow evaluation asynchronously after the LLM trace
-        has already been persisted.
-        """
-        try:
-            if self._shadow_worker is None:
-                from .shadow.worker import ShadowWorker
-
-                self._shadow_worker = ShadowWorker()
-
-            self._shadow_worker.evaluate_trace(
-                trace_id
-            )
-
-        except Exception as error:
-            print(
-                f"ControlPlane shadow evaluation failed: {error}"
-            )
-
-    # =========================================================
-    # SPANS
-    # =========================================================
-
-    def record_span(
+    def _create_span(
         self,
         *,
         trace_id: str,
-        span_id: str,
         parent_span_id: str | None,
         name: str,
         span_type: str,
-        input: str | None = None,
-        output: str | None = None,
-        duration_ms: int | None = None,
-        status: str = "success",
-        metadata: dict | None = None,
+        input_data: Any,
+        output_data: Any,
+        duration_ms: int | None,
+        status: str,
+        metadata: dict | None,
+        started_at: str | None,
+        ended_at: str | None,
     ):
         payload = {
-            "trace_id": trace_id,
-            "span_id": span_id,
             "parent_span_id": parent_span_id,
-
             "name": name,
             "span_type": span_type,
-
-            "input": input,
-            "output": output,
-
+            "input": input_data,
+            "output": output_data,
             "duration_ms": duration_ms,
-
             "status": status,
-
             "metadata": metadata or {},
         }
 
-        # Spans remain asynchronous so telemetry doesn't
-        # unnecessarily block the application.
-        self._executor.submit(
-            self._send_span,
+        if started_at is not None:
+            payload["started_at"] = started_at
+        if ended_at is not None:
+            payload["ended_at"] = ended_at
+
+        # No span ID is supplied. The API creates it.
+        return self._post(
+            f"/traces/{trace_id}/spans",
             payload,
         )
 
-    def _send_span(
-        self,
-        payload: dict,
-    ):
-        try:
-            response = httpx.post(
-                f"{self.api_url}/spans",
-                json=payload,
-                timeout=5.0,
-            )
-
-            response.raise_for_status()
-
-            print(
-                "SPAN STORED:",
-                payload["name"],
-                payload["span_id"],
-                "trace:",
-                payload["trace_id"],
-            )
-
-        except Exception as error:
-            print(
-                f"ControlPlane span failed: {error}"
-            )
-
-    # =========================================================
-    # FLUSH
-    # =========================================================
-
     def flush(self):
-        """
-        Wait for all queued telemetry requests to finish.
-
-        The executor is recreated afterward so the
-        ControlPlane instance can continue to be used.
-        """
-
-        print(
-            "FLUSHING CONTROLPLANE TELEMETRY..."
-        )
-
-        self._executor.shutdown(
-            wait=True
-        )
-
-        self._executor = ThreadPoolExecutor(
-            max_workers=4
-        )
-
-        print(
-            "CONTROLPLANE TELEMETRY FLUSHED."
-        )
-
-    # =========================================================
-    # SHUTDOWN
-    # =========================================================
+        # Public only for application shutdown/testing; IDs remain private.
+        self._executor.shutdown(wait=True)
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def shutdown(self):
-        """
-        Permanently shut down telemetry workers.
-        """
-
-        print(
-            "SHUTTING DOWN CONTROLPLANE..."
-        )
-
-        self._executor.shutdown(
-            wait=True
-        )
-
-        print(
-            "CONTROLPLANE SHUT DOWN."
-        )
+        self._executor.shutdown(wait=True)
