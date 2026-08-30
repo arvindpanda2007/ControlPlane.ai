@@ -17,9 +17,18 @@ const res = await fetch(`${API_BASE}${path}`, { signal: AbortSignal.timeout(1000
 if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
 return res.json() as Promise<T>;
 }
+
+async function apiGetTraceDetail(traceId: string): Promise<ApiTraceDetail> {
+const [trace, spans] = await Promise.all([
+  apiGet<ApiTrace>(`/traces/${traceId}`),
+  apiGet<ApiSpan[]>(`/traces/${traceId}/spans`),
+]);
+return { trace, spans };
+}
 // ─── API Types ────────────────────────────────────────────────────────────────
 interface ApiTrace {
 id: string;
+run_id?: string;
 created_at: string;
 provider: string;
 model: string;
@@ -76,6 +85,29 @@ source: string;
 target: string;
 type?: string;
 }
+interface ApiApplication {
+id: string;
+application_id: string;
+name: string;
+session_id: string;
+created_at: string;
+run_count: number;
+}
+
+interface ApiRun {
+id: string;
+run_id: string;
+application_id: string;
+created_at: string;
+started_at: string | null;
+ended_at: string | null;
+latency_ms: number | null;
+status: string;
+input: string | null;
+output: string | null;
+context: string | null;
+}
+
 interface ApiTraceDetail {
 trace: ApiTrace;
 spans: ApiSpan[];
@@ -200,6 +232,7 @@ interface WFEdge { from: string; to: string; }
 // ─── App State ────────────────────────────────────────────────────────────────
 type Screen = "home" | "app" | "trace";
 interface AppGroup {
+applicationId: string;
 sessionId: string;
 name: string;
 traces: ApiTrace[];           // Root workflow traces (the actual runs).
@@ -492,43 +525,33 @@ if (values.length === 0) return null;
 const sorted = [...values].sort((a, b) => a - b);
 return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
 }
-function groupTracesBySession(allTraces: ApiTrace[]): AppGroup[] {
-const map = new Map<string, ApiTrace[]>();
-for (const t of allTraces) {
-const key = t.session_id || "default";
-if (!map.has(key)) map.set(key, []);
-map.get(key)!.push(t);
-}
-return [...map.entries()].map(([sessionId, sessionTraces]) => {
-// Root workflow traces are the actual runs (no parent).
-// Child traces are Shadow LLM evaluation records (have parent_trace_id).
+function buildAppGroup(
+application: ApiApplication,
+allTraces: ApiTrace[],
+): AppGroup {
+const sessionTraces = allTraces;
+// Root workflow traces correspond to the runs created under this application.
+// Child traces are nested LLM/evaluation records owned by those runs.
 const rootTraces = sessionTraces.filter(t => t.parent_trace_id === null);
 const childTraces = sessionTraces.filter(t => t.parent_trace_id !== null);
 
-// Reliability from root (workflow) traces only.
 const successful = rootTraces.filter(t => t.status === "success").length;
 const reliability = rootTraces.length > 0
   ? (successful / rootTraces.length) * 100 : 0;
 
-// Quality from Shadow child traces that have a factuality score.
 const evaluatedChildren = childTraces.filter(t => t.factuality_score != null);
 const quality = evaluatedChildren.length > 0
   ? (evaluatedChildren.reduce((s, t) => s + (t.factuality_score || 0), 0) / evaluatedChildren.length) * 100
   : null;
 
-// Latency from root traces (end-to-end workflow latency).
 const latencies = rootTraces.filter(t => t.latency_ms != null).map(t => t.latency_ms!);
 const p95Latency = computeP95(latencies);
 const avgLatency = latencies.length > 0
   ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null;
 
-// Cost from child traces (they carry the real LLM token costs).
 const totalCost = childTraces.reduce((s, t) => s + (t.estimated_cost_usd || 0), 0);
-
-// Safety flags from all traces.
 const safetyFlags = sessionTraces.filter(t => t.safety_flag).length;
 
-// Shadow quality distribution counts from child traces.
 const shadowCounts = {
   supported: childTraces.filter(t => t.factuality_status === "supported").length,
   partial: childTraces.filter(t => t.factuality_status === "partially_supported").length,
@@ -537,9 +560,6 @@ const shadowCounts = {
   total: childTraces.length,
 };
 
-// In Default / All Traces, the selected workflow run is a root trace,
-// while token usage and cost can live on its child traces. Attach those
-// child totals to the corresponding root before the workspace receives it.
 const childTotals = new Map<string, {
   input: number;
   output: number;
@@ -551,7 +571,6 @@ const childTotals = new Map<string, {
 
 for (const child of childTraces) {
   if (!child.parent_trace_id) continue;
-
   const totals = childTotals.get(child.parent_trace_id) || {
     input: 0,
     output: 0,
@@ -565,24 +584,20 @@ for (const child of childTraces) {
     totals.input += child.input_tokens;
     totals.hasInput = true;
   }
-
   if (child.output_tokens != null && child.output_tokens > 0) {
     totals.output += child.output_tokens;
     totals.hasOutput = true;
   }
-
   if (child.estimated_cost_usd != null && child.estimated_cost_usd > 0) {
     totals.cost += child.estimated_cost_usd;
     totals.hasCost = true;
   }
-
   childTotals.set(child.parent_trace_id, totals);
 }
 
 const enrichedRootTraces = rootTraces.map(trace => {
   const totals = childTotals.get(trace.id);
   if (!totals) return trace;
-
   return {
     ...trace,
     input_tokens:
@@ -603,29 +618,79 @@ const enrichedRootTraces = rootTraces.map(trace => {
 const sorted = [...enrichedRootTraces].sort(
   (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
 );
-const lastActivity = sorted[0]?.created_at || null;
+const lastActivity = sorted[0]?.created_at || application.created_at || null;
 
 let health: "healthy" | "warning" | "critical" = "healthy";
 if (reliability < 90 || (quality != null && quality < 80)) health = "critical";
 else if (reliability < 97 || (quality != null && quality < 90) || safetyFlags > 0) health = "warning";
 
-const name = sessionId === "default"
-  ? "All Traces"
-  : sessionId.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-
 return {
-  sessionId, name,
-  traces: sorted, // Root workflow traces only — shown in workspace runs list.
-  reliability, quality, p95Latency, avgLatency,
-  totalCost, safetyFlags, lastActivity, health, shadowCounts,
+  applicationId: application.application_id || application.id,
+  sessionId: application.session_id,
+  name: application.name,
+  traces: sorted,
+  reliability,
+  quality,
+  p95Latency,
+  avgLatency,
+  totalCost,
+  safetyFlags,
+  lastActivity,
+  health,
+  shadowCounts,
 };
+}
 
-}).sort((a, b) => {
-const ta = a.lastActivity ? new Date(a.lastActivity).getTime() : 0;
-const tb = b.lastActivity ? new Date(b.lastActivity).getTime() : 0;
-return tb - ta;
+async function loadApplicationGroups(): Promise<AppGroup[]> {
+const applications = await apiGet<ApiApplication[]>("/applications");
+
+const groups = await Promise.all(
+  applications.map(async application => {
+    const runs = await apiGet<ApiRun[]>(
+      `/applications/${application.application_id || application.id}/runs?limit=500`,
+    );
+
+    const traceLists = await Promise.all(
+      runs.map(run =>
+        apiGet<ApiTrace[]>(`/runs/${run.run_id || run.id}/traces?limit=2000`)
+          .catch(() => [] as ApiTrace[])
+      )
+    );
+
+    const traces = traceLists.flatMap((traceList, index) => {
+      const run = runs[index];
+      return traceList.map(trace => ({
+        ...trace,
+        run_id: trace.run_id || run?.run_id || run?.id,
+        session_id: trace.session_id || application.session_id,
+      }));
+    });
+
+    // The run endpoint is authoritative for lifecycle data. When a root trace
+    // does not carry those fields, copy them from its owning run.
+    const runById = new Map(runs.map(run => [run.run_id || run.id, run]));
+    const normalized = traces.map(trace => {
+      const run = trace.run_id ? runById.get(trace.run_id) : undefined;
+      if (!run) return trace;
+      return {
+        ...trace,
+        created_at: trace.created_at || run.created_at,
+        status: trace.status || run.status,
+        latency_ms: trace.latency_ms ?? run.latency_ms,
+      };
+    });
+
+    return buildAppGroup(application, normalized);
+  })
+);
+
+return groups.sort((a, b) => {
+  const ta = a.lastActivity ? new Date(a.lastActivity).getTime() : 0;
+  const tb = b.lastActivity ? new Date(b.lastActivity).getTime() : 0;
+  return tb - ta;
 });
 }
+
 function fmtMs(ms: number | null | undefined): string {
 if (ms == null) return "N/A";
 if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -1974,13 +2039,9 @@ const [error, setError] = useState<string | null>(null);
 const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
 const [runDurations, setRunDurations] = useState<Record<string, number | null>>({});
-const [allTraces, setAllTraces] = useState<ApiTrace[]>([]);
+const [allTraces, setAllTraces] = useState<ApiTrace[]>(sessionTraces);
 const [childTraces, setChildTraces] = useState<ApiTrace[]>([]);
-useEffect(() => {
-apiGet<ApiTrace[]>("/traces?limit=500")
-.then(setAllTraces)
-.catch(() => {});
-}, []);
+useEffect(() => { setAllTraces(sessionTraces); }, [sessionTraces]);
 useEffect(() => {
 const tracesNeedingDuration = sessionTraces.filter(
 trace => (trace.latency_ms == null || trace.latency_ms <= 0) && runDurations[trace.id] === undefined
@@ -1991,13 +2052,10 @@ if (tracesNeedingDuration.length === 0) return;
 Promise.all(
   tracesNeedingDuration.map(async trace => {
     try {
-      const [data, traceInsights] = await Promise.all([
-        apiGet<ApiTraceDetail>(`/traces/${trace.id}`),
-        apiGet<ApiInsights>(`/traces/${trace.id}/insights`).catch(() => null),
-      ]);
+      const data = await apiGetTraceDetail(trace.id);
       return [
         trace.id,
-        getResolvedRunDuration(data.trace, data.spans || [], traceInsights),
+        getResolvedRunDuration(data.trace, data.spans || [], null),
       ] as const;
     } catch {
       return [trace.id, null] as const;
@@ -2025,11 +2083,12 @@ const loadTrace = async (showLoading = false) => {
   if (showLoading) setLoading(true);
 
   try {
-    const [d, ins, freshTraces] = await Promise.all([
-      apiGet<ApiTraceDetail>(`/traces/${traceId}`),
-      apiGet<ApiInsights>(`/traces/${traceId}/insights`).catch(() => null),
-      apiGet<ApiTrace[]>("/traces?limit=500").catch(() => []),
-    ]);
+    const d = await apiGetTraceDetail(traceId);
+    const ins: ApiInsights | null = null;
+    const resolvedRunId = d.trace?.run_id || sessionTraces.find(t => t.id === traceId)?.run_id;
+    const freshTraces = resolvedRunId
+      ? await apiGet<ApiTrace[]>(`/runs/${resolvedRunId}/traces?limit=2000`).catch(() => [])
+      : sessionTraces;
 
     if (cancelled) return;
 
@@ -2277,9 +2336,10 @@ const [tab, setTab] = useState<AppTab>("overview");
 const [analytics, setAnalytics] = useState<ApiAnalytics | null>(null);
 const [search, setSearch] = useState("");
 const [runDurations, setRunDurations] = useState<Record<string, number | null>>({});
-useEffect(() => {
-apiGet<ApiAnalytics>("/analytics").then(setAnalytics).catch(() => {});
-}, []);
+// The current API exposes application/run/trace/span resources but no
+// application-scoped analytics endpoint. Keep this optional so the workspace
+// remains usable without making a request that the backend cannot satisfy.
+useEffect(() => { setAnalytics(null); }, []);
 const filtered = app.traces.filter(t =>
 !search ||
 t.id.toLowerCase().includes(search.toLowerCase()) ||
@@ -2329,13 +2389,10 @@ if (tracesNeedingDuration.length === 0) return;
 Promise.all(
   tracesNeedingDuration.map(async trace => {
     try {
-      const [data, traceInsights] = await Promise.all([
-        apiGet<ApiTraceDetail>(`/traces/${trace.id}`),
-        apiGet<ApiInsights>(`/traces/${trace.id}/insights`).catch(() => null),
-      ]);
+      const data = await apiGetTraceDetail(trace.id);
       return [
         trace.id,
-        getResolvedRunDuration(data.trace, data.spans || [], traceInsights),
+        getResolvedRunDuration(data.trace, data.spans || [], null),
       ] as const;
     } catch {
       return [trace.id, null] as const;
@@ -2789,32 +2846,36 @@ return (
 }
 // ─── Applications Home ────────────────────────────────────────────────────────
 function ApplicationsHome({ onSelectApp }: { onSelectApp: (app: AppGroup) => void }) {
-const [traces, setTraces] = useState<ApiTrace[]>([]);
+const [apps, setApps] = useState<AppGroup[]>([]);
 const [loading, setLoading] = useState(true);
 const [error, setError] = useState<string | null>(null);
 const [search, setSearch] = useState("");
 const [filter, setFilter] = useState<"all" | "healthy" | "warning" | "critical">("all");
 const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
-const load = useCallback(() => {
-setLoading(true);
-setError(null);
-apiGet<ApiTrace[]>("/traces?limit=500")
-.then(setTraces)
-.catch(err => setError(err.message))
-.finally(() => setLoading(false));
+const load = useCallback(async () => {
+  setLoading(true);
+  setError(null);
+  try {
+    const nextApps = await loadApplicationGroups();
+    setApps(nextApps);
+  } catch (err: any) {
+    setError(err?.message || "Failed to load applications");
+  } finally {
+    setLoading(false);
+  }
 }, []);
 useEffect(() => { load(); }, [load]);
-const apps = groupTracesBySession(traces);
+
 const filtered = apps.filter(a => {
-if (filter !== "all" && a.health !== filter) return false;
-if (search && !a.name.toLowerCase().includes(search.toLowerCase()) &&
-!a.sessionId.toLowerCase().includes(search.toLowerCase())) return false;
-return true;
+  if (filter !== "all" && a.health !== filter) return false;
+  if (search && !a.name.toLowerCase().includes(search.toLowerCase()) &&
+      !a.sessionId.toLowerCase().includes(search.toLowerCase())) return false;
+  return true;
 });
 const counts = {
-healthy: apps.filter(a => a.health === "healthy").length,
-warning: apps.filter(a => a.health === "warning").length,
-critical: apps.filter(a => a.health === "critical").length,
+  healthy: apps.filter(a => a.health === "healthy").length,
+  warning: apps.filter(a => a.health === "warning").length,
+  critical: apps.filter(a => a.health === "critical").length,
 };
 return (
 <div className="flex flex-col h-screen bg-cp-app">
@@ -2839,7 +2900,6 @@ return (
 </div>
 
   <div className="flex-1 overflow-y-auto p-6">
-    {/* Page header */}
     <div className="flex items-center justify-between mb-6">
       <div>
         <h1 className="text-xl font-bold text-cp-text">Applications</h1>
@@ -2847,12 +2907,11 @@ return (
           AI application observability and control plane
         </p>
       </div>
-      <button className="flex items-center gap-1.5 text-xs bg-cp-purple text-white px-3 py-2 rounded hover:bg-cp-purple/90 transition-colors">
+      <button className="flex items-center gap-1.5 text-xs bg-cp-purple text-white px-3 py-2 rounded hover\:bg-cp-purple/90 transition-colors">
         <Plus size={12} /> Add Application
       </button>
     </div>
 
-    {/* Status summary */}
     {!loading && !error && apps.length > 0 && (
       <div className="flex gap-4 mb-6">
         {[
@@ -2869,7 +2928,6 @@ return (
       </div>
     )}
 
-    {/* Controls */}
     <div className="flex items-center gap-3 mb-6">
       <div className="relative flex-1 max-w-xs">
         <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-cp-muted" />
@@ -2882,7 +2940,7 @@ return (
         {(["all", "healthy", "warning", "critical"] as const).map(f => (
           <button key={f} onClick={() => setFilter(f)}
             className={`px-2.5 py-1 text-xs rounded capitalize transition-colors ${
-              filter === f ? "bg-cp-active text-cp-text" : "text-cp-secondary hover:text-cp-text"
+              filter === f ? "bg-cp-active text-cp-text" : "text-cp-secondary hover\:text-cp-text"
             }`}>
             {f}
           </button>
@@ -2891,24 +2949,22 @@ return (
 
       <div className="flex gap-0.5 bg-cp-elevated border border-cp-border rounded p-0.5 ml-auto">
         <button onClick={() => setViewMode("grid")}
-          className={`p-1.5 rounded transition-colors ${viewMode === "grid" ? "bg-cp-active text-cp-text" : "text-cp-muted hover:text-cp-secondary"}`}>
+          className={`p-1.5 rounded transition-colors ${viewMode === "grid" ? "bg-cp-active text-cp-text" : "text-cp-muted hover\:text-cp-secondary"}`}>
           <Grid3x3 size={13} />
         </button>
         <button onClick={() => setViewMode("list")}
-          className={`p-1.5 rounded transition-colors ${viewMode === "list" ? "bg-cp-active text-cp-text" : "text-cp-muted hover:text-cp-secondary"}`}>
+          className={`p-1.5 rounded transition-colors ${viewMode === "list" ? "bg-cp-active text-cp-text" : "text-cp-muted hover\:text-cp-secondary"}`}>
           <LayoutList size={13} />
         </button>
       </div>
     </div>
 
-    {/* Loading */}
     {loading && (
       <div className="flex items-center justify-center py-24 text-cp-secondary text-sm gap-2">
         <Loader2 size={18} className="animate-spin" /> Connecting to backend…
       </div>
     )}
 
-    {/* Error */}
     {!loading && error && (
       <div className="flex flex-col items-center justify-center py-24">
         <AlertCircle size={32} className="text-cp-error mb-4" />
@@ -2926,20 +2982,18 @@ return (
       </div>
     )}
 
-    {/* Empty state */}
     {!loading && !error && apps.length === 0 && (
       <div className="flex flex-col items-center justify-center py-24 text-cp-secondary text-sm">
         <BarChart2 size={32} className="mb-3 text-cp-muted" />
-        No traces found. Send your first trace to get started.
+        No applications found. Create an application and send your first run to get started.
       </div>
     )}
 
-    {/* Applications grid / list */}
     {!loading && !error && filtered.length > 0 && (
       viewMode === "grid" ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {filtered.map(app => (
-            <AppCard key={app.sessionId} app={app} onClick={() => onSelectApp(app)} />
+            <AppCard key={app.applicationId} app={app} onClick={() => onSelectApp(app)} />
           ))}
         </div>
       ) : (
@@ -2954,9 +3008,9 @@ return (
     )}
   </div>
 </div>
-
 );
 }
+
 function AppCard({ app, onClick }: { app: AppGroup; onClick: () => void }) {
 const hc = healthColor(app.health);
 return (
@@ -3019,7 +3073,7 @@ return (
 {apps.map((app, i) => {
 const hc = healthColor(app.health);
 return (
-<button key={app.sessionId} onClick={() => onSelect(app)}
+<button key={app.applicationId} onClick={() => onSelect(app)}
 className={`w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-cp-hover transition-colors ${i > 0 ? "border-t border-cp-border/50" : ""}`}>
 <div className="flex items-center gap-2 flex-1 min-w-0">
 <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: hc }} />
