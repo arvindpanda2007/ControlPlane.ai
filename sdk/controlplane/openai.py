@@ -62,7 +62,6 @@ class OpenAIClient:
         model: str,
         messages: list[dict],
         context: Any = None,
-        session_id: str | None = None,
         run: Run | None = None,
         trace: Run | None = None,
     ):
@@ -93,10 +92,16 @@ class OpenAIClient:
         start_time = time.perf_counter()
         started_at = datetime.now(timezone.utc)
 
+        # Only untrusted user messages should be inspected by the
+        # prompt-injection detector. System/developer instructions and
+        # assistant history are trusted control-plane inputs; scanning them
+        # can create false positives (e.g. a system prompt discussing
+        # instruction overrides).
         input_text = "\n".join(
             str(message.get("content", ""))
             for message in messages
-            if message.get("content") is not None
+            if message.get("role") == "user"
+            and message.get("content") is not None
         )
 
         trace_context = _serialize_context(context)

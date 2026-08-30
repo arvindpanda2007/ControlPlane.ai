@@ -248,6 +248,9 @@ p95Latency: number | null;
 avgLatency: number | null;
 totalCost: number;
 safetyFlags: number;
+// Safety interventions can be child traces of an error root. Keep the
+// actual flagged/blocked traces available to the Safety tab.
+safetyTraces: ApiTrace[];
 lastActivity: string | null;
 health: "healthy" | "warning" | "critical";
 // Shadow evaluation counts (from child traces).
@@ -544,9 +547,38 @@ const sessionTraces = allTraces;
 const rootTraces = sessionTraces.filter(t => t.parent_trace_id === null);
 const childTraces = sessionTraces.filter(t => t.parent_trace_id !== null);
 
-const successful = rootTraces.filter(t => t.status === "success").length;
-const reliability = rootTraces.length > 0
-  ? (successful / rootTraces.length) * 100 : 0;
+// Safety interventions are frequently recorded as child traces. In that
+// case the workflow root can legitimately have status="error" because the
+// blocked child terminated the workflow. Treat the entire owning workflow as
+// safety-blocked rather than as an application failure.
+const directSafetyTraces = sessionTraces.filter(isSafetyBlockedTrace);
+const parentByTraceId = new Map(
+  sessionTraces.map(t => [t.id, t.parent_trace_id])
+);
+const safetyAffectedTraceIds = new Set<string>();
+
+for (const safetyTrace of directSafetyTraces) {
+  let currentId: string | null = safetyTrace.id;
+  while (currentId) {
+    if (safetyAffectedTraceIds.has(currentId)) break;
+    safetyAffectedTraceIds.add(currentId);
+    currentId = parentByTraceId.get(currentId) ?? null;
+  }
+}
+
+const blockedRootTraces = rootTraces.filter(
+  t => safetyAffectedTraceIds.has(t.id)
+);
+
+const operationalRootTraces = rootTraces.filter(
+  t => !safetyAffectedTraceIds.has(t.id)
+);
+const successful = operationalRootTraces.filter(
+  t => t.status === "success"
+).length;
+const reliability = operationalRootTraces.length > 0
+  ? (successful / operationalRootTraces.length) * 100
+  : (rootTraces.length > 0 ? 100 : 0);
 
 // Use the canonical Shadow evaluation records returned by
 // /traces/:id/insights. This is the same data source used by the Trace
@@ -592,7 +624,10 @@ const avgLatency = latencies.length > 0
   ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null;
 
 const totalCost = childTraces.reduce((s, t) => s + (t.estimated_cost_usd || 0), 0);
-const safetyFlags = sessionTraces.filter(t => t.safety_flag).length;
+// Count the actual safety intervention traces. These may be child traces
+// whose root workflow is persisted as status="error".
+const safetyInterventionTraces = directSafetyTraces;
+const safetyFlags = safetyInterventionTraces.length;
 
 const shadowCounts = {
   supported: evaluations.filter(e => e.factuality_status === "supported").length,
@@ -670,6 +705,7 @@ return {
   applicationId: application.application_id || application.id,
   name: application.name,
   traces: sorted,
+  safetyTraces: safetyInterventionTraces,
   reliability,
   quality,
   p95Latency,
@@ -949,12 +985,23 @@ return new Date(iso).toLocaleDateString();
 }
 function statusColor(s: string): string {
 if (s === "success") return "#16a34a";
-if (s === "error" || s === "blocked") return "#dc2626";
+if (s === "error") return "#dc2626";
+if (s === "blocked") return "#d97706";
 if (s === "warning") return "#d97706";
 if (s === "running") return "#2563eb";
 if (s === "pending") return "#6b6b68";
 return "#9e9e9b";
 }
+// Canonical safety-intervention classifier.
+// A blocked request may be represented by status, safety_flag, or safety_action.
+function isSafetyBlockedTrace(trace: ApiTrace): boolean {
+  return (
+    trace.status.trim().toLowerCase() === "blocked" ||
+    trace.safety_flag === true ||
+    trace.safety_action?.trim().toLowerCase() === "block"
+  );
+}
+
 function healthColor(h: "healthy" | "warning" | "critical"): string {
 return h === "healthy" ? "#16a34a" : h === "warning" ? "#d97706" : "#dc2626";
 }
@@ -2393,8 +2440,30 @@ t.status.toLowerCase().includes(search.toLowerCase())
 const totalTokens = app.traces.reduce(
 (s, t) => s + (t.input_tokens || 0) + (t.output_tokens || 0), 0
 );
-const errorTraces = app.traces.filter(t => t.status === "error" || t.status === "blocked");
-const safetyTraces = app.traces.filter(t => t.safety_flag);
+// Application errors and safety interventions are separate outcomes.
+const blockedTraces = app.safetyTraces;
+const blockedTraceIds = new Set(app.safetyTraces.map(t => t.id));
+const appTraceById = new Map(app.traces.map(t => [t.id, t]));
+const blockedRootIds = new Set<string>();
+
+for (const safetyTrace of app.safetyTraces) {
+  let currentId: string | null = safetyTrace.id;
+  while (currentId) {
+    if (appTraceById.has(currentId)) {
+      blockedRootIds.add(currentId);
+      break;
+    }
+    const current = app.safetyTraces.find(t => t.id === currentId);
+    currentId = current?.parent_trace_id ?? null;
+  }
+}
+
+const errorTraces = app.traces.filter(
+  t =>
+    t.status.trim().toLowerCase() === "error" &&
+    !blockedRootIds.has(t.id)
+  );
+const safetyTraces = app.safetyTraces;
 const latencyBuckets = [500, 1000, 2000, 5000, Infinity];
 const latencyLabels = ["<0.5s", "0.5–1s", "1–2s", "2–5s", ">5s"];
 const latencyData = latencyLabels.map((label, i) => ({
@@ -2689,8 +2758,8 @@ return (
               color: app.reliability >= 97 ? "#16a34a" : "#d97706" },
             { label: "Error Traces", value: String(errorTraces.length),
               color: errorTraces.length > 0 ? "#dc2626" : "#16a34a" },
-            { label: "Blocked", value: String(app.traces.filter(t => t.status === "blocked").length),
-              color: "#d97706" },
+            { label: "Blocked", value: String(blockedRootIds.size),
+              color: blockedRootIds.size > 0 ? "#d97706" : "#16a34a" },
           ].map(({ label, value, color }) => (
             <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4 text-center">
               <div className="text-2xl font-bold font-mono" style={{ color }}>{value}</div>
@@ -2839,10 +2908,10 @@ return (
           {[
             { label: "Safety Flags", value: String(app.safetyFlags),
               color: app.safetyFlags > 0 ? "#dc2626" : "#16a34a" },
-            { label: "Blocked", value: String(app.traces.filter(t => t.status === "blocked").length),
-              color: "#d97706" },
-            { label: "Safe Rate", value: `${((1 - app.safetyFlags / Math.max(1, app.traces.length)) * 100).toFixed(1)}%`,
-              color: "#16a34a" },
+            { label: "Blocked", value: String(blockedRootIds.size),
+              color: blockedRootIds.size > 0 ? "#d97706" : "#16a34a" },
+            { label: "Safe Rate", value: `${((1 - blockedRootIds.size / Math.max(1, app.traces.length)) * 100).toFixed(1)}%`,
+              color: blockedRootIds.size > 0 ? "#d97706" : "#16a34a" },
           ].map(({ label, value, color }) => (
             <div key={label} className="bg-cp-surface border border-cp-border rounded-lg p-4 text-center">
               <div className="text-3xl font-bold font-mono" style={{ color }}>{value}</div>

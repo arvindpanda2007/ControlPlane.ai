@@ -1,9 +1,13 @@
 import json
+import logging
 import uuid
 
 from api.database import get_connection
 
 from .evaluator import ShadowEvaluator
+
+
+logger = logging.getLogger("controlplane.shadow")
 
 
 class ShadowWorker:
@@ -23,10 +27,15 @@ class ShadowWorker:
         """
         Evaluate all completed LLM child traces belonging to a completed
         application run. The root workflow trace itself is not evaluated.
+
+        Shadow evaluation is background work. It must never write to the
+        application's interactive stdout.
         """
-        print(
-            f"Shadow: evaluating run {run_id} "
-            f"(root trace {root_trace_id})"
+
+        logger.debug(
+            "Shadow: evaluating run %s (root trace %s)",
+            run_id,
+            root_trace_id,
         )
 
         with get_connection() as connection:
@@ -45,7 +54,10 @@ class ShadowWorker:
         trace_ids = [str(row[0]) for row in rows]
 
         if not trace_ids:
-            print(f"Shadow: no child traces found for run {run_id}")
+            logger.debug(
+                "Shadow: no child traces found for run %s",
+                run_id,
+            )
             return
 
         # Create the lifecycle rows before evaluation starts.
@@ -82,10 +94,12 @@ class ShadowWorker:
                 self.evaluate_trace(trace_id)
 
             except Exception as error:
-                print(
-                    f"Shadow: run {run_id} failed for trace "
-                    f"{trace_id}: {error}"
+                logger.exception(
+                    "Shadow: run %s failed for trace %s",
+                    run_id,
+                    trace_id,
                 )
+
                 try:
                     with get_connection() as connection:
                         with connection.cursor() as cursor:
@@ -97,15 +111,16 @@ class ShadowWorker:
                                 """,
                                 (str(error), trace_id),
                             )
-                except Exception as store_error:
-                    print(
-                        f"Shadow: failed to store failure for "
-                        f"{trace_id}: {store_error}"
+                except Exception:
+                    logger.exception(
+                        "Shadow: failed to store failure for %s",
+                        trace_id,
                     )
 
-        print(
-            f"Shadow: finished run {run_id}; "
-            f"processed {len(trace_ids)} child traces"
+        logger.debug(
+            "Shadow: finished run %s; processed %s child traces",
+            run_id,
+            len(trace_ids),
         )
 
     # =========================================================
@@ -142,11 +157,12 @@ class ShadowWorker:
         - recommendations
 
         The complete result is stored in the
-        traces.shadow_evaluation JSONB column.
+        shadow_evaluations table.
         """
 
-        print(
-            f"Shadow: evaluating trace {trace_id}"
+        logger.debug(
+            "Shadow: evaluating trace %s",
+            trace_id,
         )
 
         # =====================================================
@@ -155,7 +171,6 @@ class ShadowWorker:
 
         with get_connection() as connection:
             with connection.cursor() as cursor:
-
                 cursor.execute(
                     """
                     SELECT
@@ -173,8 +188,9 @@ class ShadowWorker:
                 trace = cursor.fetchone()
 
         if trace is None:
-            print(
-                f"Shadow: trace {trace_id} not found"
+            logger.warning(
+                "Shadow: trace %s not found",
+                trace_id,
             )
             return
 
@@ -191,8 +207,9 @@ class ShadowWorker:
         # =====================================================
 
         if not output:
-            print(
-                f"Shadow: trace {trace_id} has no output"
+            logger.warning(
+                "Shadow: trace %s has no output",
+                trace_id,
             )
             return
 
@@ -212,7 +229,6 @@ class ShadowWorker:
 
         with get_connection() as connection:
             with connection.cursor() as cursor:
-
                 cursor.execute(
                     """
                     SELECT
@@ -237,36 +253,28 @@ class ShadowWorker:
         spans = []
 
         for row in rows:
-
             spans.append(
                 {
                     "id": str(row[0]),
-
                     "parent_span_id": (
                         str(row[1])
                         if row[1]
                         else None
                     ),
-
                     "name": row[2],
-
                     "span_type": row[3],
-
                     "input": row[4],
-
                     "output": row[5],
-
                     "duration_ms": row[6],
-
                     "status": row[7],
-
                     "metadata": row[8] or {},
                 }
             )
 
-        print(
-            f"Shadow: loaded {len(spans)} spans "
-            f"from workflow {workflow_trace_id}"
+        logger.debug(
+            "Shadow: loaded %s spans from workflow %s",
+            len(spans),
+            workflow_trace_id,
         )
 
         # =====================================================
@@ -274,7 +282,6 @@ class ShadowWorker:
         # =====================================================
 
         try:
-
             result = self.evaluator.evaluate(
                 user_input=input_text or "",
                 context=context,
@@ -283,10 +290,9 @@ class ShadowWorker:
             )
 
         except Exception as error:
-
-            print(
-                f"Shadow: evaluation failed for "
-                f"{trace_id}: {error}"
+            logger.exception(
+                "Shadow: evaluation failed for %s",
+                trace_id,
             )
 
             try:
@@ -300,10 +306,10 @@ class ShadowWorker:
                             """,
                             (str(error), trace_id),
                         )
-            except Exception as store_error:
-                print(
-                    f"Shadow: failed to store evaluation failure "
-                    f"for {trace_id}: {store_error}"
+            except Exception:
+                logger.exception(
+                    "Shadow: failed to store evaluation failure for %s",
+                    trace_id,
                 )
 
             return
@@ -313,12 +319,10 @@ class ShadowWorker:
         # =====================================================
 
         if not isinstance(result, dict):
-
-            print(
-                f"Shadow: invalid evaluation result "
-                f"for {trace_id}"
+            logger.error(
+                "Shadow: invalid evaluation result for %s",
+                trace_id,
             )
-
             return
 
         # =====================================================
@@ -348,75 +352,52 @@ class ShadowWorker:
         # 8. BACKWARD COMPATIBILITY
         # =====================================================
 
-        if factuality_status == "excellent":
-
-            factuality_status = (
-                "supported"
-            )
-
-        elif factuality_status == "good":
-
-            factuality_status = (
-                "supported"
-            )
+        if factuality_status in {
+            "excellent",
+            "good",
+        }:
+            factuality_status = "supported"
 
         elif factuality_status == "needs_improvement":
-
-            factuality_status = (
-                "partially_supported"
-            )
+            factuality_status = "partially_supported"
 
         elif factuality_status == "poor":
-
-            factuality_status = (
-                "unsupported"
-            )
+            factuality_status = "unsupported"
 
         elif factuality_status == "not_applicable":
-
-            factuality_status = (
-                "not_applicable"
-            )
+            factuality_status = "not_applicable"
 
         # =====================================================
         # 9. SERIALIZE JSONB
         # =====================================================
 
         try:
-
-            shadow_evaluation_json = (
-                json.dumps(
-                    result,
-                    ensure_ascii=False,
-                )
+            shadow_evaluation_json = json.dumps(
+                result,
+                ensure_ascii=False,
             )
 
         except (
             TypeError,
             ValueError,
         ) as error:
-
-            print(
-                f"Shadow: failed to serialize "
-                f"evaluation for {trace_id}: "
-                f"{error}"
+            logger.exception(
+                "Shadow: failed to serialize evaluation for %s",
+                trace_id,
             )
-
             return
+
+        # Keep this variable intentionally generated for compatibility
+        # with the existing evaluation pipeline.
+        _ = shadow_evaluation_json
 
         # =====================================================
         # 10. STORE COMPLETE EVALUATION
         # =====================================================
 
-        # The Shadow Evaluation has its own lifecycle/table. Do not write
-        # factuality fields onto `traces`: those fields belong to
-        # `shadow_evaluations`.
         try:
-
             with get_connection() as connection:
-
                 with connection.cursor() as cursor:
-
                     cursor.execute(
                         """
                         INSERT INTO shadow_evaluations (
@@ -467,13 +448,11 @@ class ShadowWorker:
                         ),
                     )
 
-        except Exception as error:
-
-            print(
-                f"Shadow: failed to store evaluation "
-                f"for {trace_id}: {error}"
+        except Exception:
+            logger.exception(
+                "Shadow: failed to store evaluation for %s",
+                trace_id,
             )
-
             return
 
         # =====================================================
@@ -510,19 +489,19 @@ class ShadowWorker:
         ):
             recommendations = []
 
-        print(
-            f"Shadow: trace {trace_id} → "
-            f"overall={overall_score} "
-            f"status={overall_status} "
-            f"recommendations={len(recommendations)}"
+        logger.debug(
+            "Shadow: trace %s → overall=%s status=%s recommendations=%s",
+            trace_id,
+            overall_score,
+            overall_status,
+            len(recommendations),
         )
 
         # =====================================================
-        # 12. PRINT TOP RECOMMENDATIONS
+        # 12. TOP RECOMMENDATIONS
         # =====================================================
 
         for recommendation in recommendations[:3]:
-
             if not isinstance(
                 recommendation,
                 dict,
@@ -539,8 +518,8 @@ class ShadowWorker:
                 "Untitled recommendation",
             )
 
-            print(
-                "Shadow recommendation:",
+            logger.debug(
+                "Shadow recommendation: %s %s",
                 severity,
                 title,
             )
