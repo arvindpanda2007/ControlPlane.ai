@@ -1,14 +1,51 @@
+from __future__ import annotations
+
+import json
 import time
+from datetime import datetime, timezone
+from typing import Any
 
 from openai import OpenAI
 
+from .client import ControlPlane, Run
 from .cost import calculate_cost
-from .client import ControlPlane
 from .injection import InjectionViolation, check_input
 from .safety import SafetyViolation, check_output
 
 
+def _serialize_context(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 class OpenAIClient:
+    """
+    OpenAI integration for the Application -> Run architecture.
+
+    Developer usage:
+
+        response = openai_client.chat(
+            model="gpt-4.1-mini",
+            messages=messages,
+            run=run,
+        )
+
+    Developers never provide application IDs, run IDs, trace IDs,
+    span IDs, or parent trace IDs.
+
+    OpenAI usage is captured from response.usage and stored as first-class
+    ControlPlane trace fields:
+      - input_tokens
+      - output_tokens
+      - estimated_cost_usd
+    """
+
     def __init__(
         self,
         controlplane: ControlPlane,
@@ -22,23 +59,51 @@ class OpenAIClient:
         *,
         model: str,
         messages: list[dict],
-        context: str | None = None,
+        context: Any = None,
         session_id: str | None = None,
-        trace=None,
+        run: Run | None = None,
+        trace: Run | None = None,
     ):
+        """
+        Execute an OpenAI chat completion and automatically record the
+        child LLM trace under the current application run.
+
+        `run` is the preferred argument.
+
+        `trace` is retained as a compatibility alias for older application
+        code, but it must still be a Run object returned by app.run().
+        """
+        if run is None:
+            run = trace
+
+        if run is None:
+            raise ValueError(
+                "OpenAIClient.chat requires the current application run. "
+                "Pass run=run from 'with app.run(...) as run:'."
+            )
+
+        if not isinstance(run, Run):
+            raise TypeError(
+                "run must be a ControlPlane Run returned by app.run()."
+            )
+
         start_time = time.perf_counter()
+        started_at = datetime.now(timezone.utc)
 
         input_text = "\n".join(
-            message["content"]
+            str(message.get("content", ""))
             for message in messages
-            if message.get("content")
+            if message.get("content") is not None
         )
 
-        # ---------------------------------------------------------
-        # WORKFLOW TRACE ID
-        # ---------------------------------------------------------
+        trace_context = _serialize_context(context)
 
-        parent_trace_id = trace.id if trace else None
+        parent_trace_id = run._trace_id
+
+        if not parent_trace_id:
+            raise RuntimeError(
+                "The OpenAI call must happen inside an active application run."
+            )
 
         # ---------------------------------------------------------
         # 1. INPUT / PROMPT INJECTION CHECK
@@ -51,46 +116,33 @@ class OpenAIClient:
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+            ended_at = datetime.now(timezone.utc)
 
-            self.controlplane.trace(
-                provider="openai",
+            self._record_llm_trace(
+                run=run,
                 model=model,
-                input=input_text,
+                input_text=input_text,
+                output_text=None,
+                input_tokens=None,
+                output_tokens=None,
                 latency_ms=latency_ms,
                 estimated_cost_usd=None,
-                context=context,
-                session_id=session_id,
+                context=trace_context,
                 status="blocked",
                 safety_flag=True,
                 safety_type=",".join(error.matches),
                 safety_action="block",
                 parent_trace_id=parent_trace_id,
+                started_at=started_at,
+                ended_at=ended_at,
             )
-
             raise
 
         # ---------------------------------------------------------
-        # 2. CREATE LLM SPAN
+        # 2. CALL OPENAI
         # ---------------------------------------------------------
 
-        llm_span = None
-
-        if trace:
-            llm_span = trace.span(
-                "openai",
-                span_type="llm",
-
-                # Record the exact input sent to this step.
-                input=input_text,
-            )
-
-            llm_span.__enter__()
-
         try:
-            # -----------------------------------------------------
-            # 3. CALL OPENAI
-            # -----------------------------------------------------
-
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -99,32 +151,29 @@ class OpenAIClient:
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+            ended_at = datetime.now(timezone.utc)
 
             # -----------------------------------------------------
-            # 4. EXTRACT OUTPUT
+            # 3. EXTRACT OUTPUT
             # -----------------------------------------------------
 
             output_text = (
                 response.choices[0].message.content or ""
             )
 
-            # Record the exact output produced by this step.
-            if llm_span:
-                llm_span.output = output_text
-
             # -----------------------------------------------------
-            # 5. EXTRACT TOKEN USAGE
+            # 4. EXTRACT REAL OPENAI TOKEN USAGE
             # -----------------------------------------------------
 
             input_tokens = None
             output_tokens = None
 
-            if response.usage:
+            if response.usage is not None:
                 input_tokens = response.usage.prompt_tokens
                 output_tokens = response.usage.completion_tokens
 
             # -----------------------------------------------------
-            # 6. CALCULATE COST
+            # 5. CALCULATE COST
             # -----------------------------------------------------
 
             estimated_cost_usd = calculate_cost(
@@ -134,104 +183,54 @@ class OpenAIClient:
             )
 
             # -----------------------------------------------------
-            # 7. UPDATE LLM SPAN METADATA
-            # -----------------------------------------------------
-
-            if llm_span:
-                llm_span.metadata.update(
-                    {
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "estimated_cost_usd": estimated_cost_usd,
-                    }
-                )
-
-            # -----------------------------------------------------
-            # 8. OUTPUT SAFETY CHECK
+            # 6. OUTPUT SAFETY CHECK
             # -----------------------------------------------------
 
             try:
                 check_output(output_text)
 
             except SafetyViolation as error:
-
-                if llm_span:
-                    llm_span.metadata.update(
-                        {
-                            "safety_flag": True,
-                            "safety_type": ",".join(
-                                error.violations
-                            ),
-                            "safety_action": "block",
-                        }
-                    )
-
-                    llm_span.__exit__(
-                        SafetyViolation,
-                        error,
-                        error.__traceback__,
-                    )
-
-                    llm_span = None
-
-                self.controlplane.trace(
-                    provider="openai",
+                self._record_llm_trace(
+                    run=run,
                     model=model,
-                    input=input_text,
-                    output=output_text,
+                    input_text=input_text,
+                    output_text=output_text,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     latency_ms=latency_ms,
                     estimated_cost_usd=estimated_cost_usd,
-                    context=context,
-                    session_id=session_id,
+                    context=trace_context,
                     status="blocked",
                     safety_flag=True,
                     safety_type=",".join(error.violations),
                     safety_action="block",
                     parent_trace_id=parent_trace_id,
+                    started_at=started_at,
+                    ended_at=ended_at,
                 )
-
                 raise
 
             # -----------------------------------------------------
-            # 9. SAFE RESPONSE
+            # 7. SUCCESSFUL LLM TRACE
             # -----------------------------------------------------
 
-            if llm_span:
-                llm_span.metadata.update(
-                    {
-                        "safety_flag": False,
-                        "safety_type": None,
-                        "safety_action": None,
-                    }
-                )
-
-                llm_span.__exit__(
-                    None,
-                    None,
-                    None,
-                )
-
-                llm_span = None
-
-            self.controlplane.trace(
-                provider="openai",
+            self._record_llm_trace(
+                run=run,
                 model=model,
-                input=input_text,
-                output=output_text,
+                input_text=input_text,
+                output_text=output_text,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
                 estimated_cost_usd=estimated_cost_usd,
-                context=context,
-                session_id=session_id,
+                context=trace_context,
                 status="success",
                 safety_flag=False,
                 safety_type=None,
                 safety_action=None,
                 parent_trace_id=parent_trace_id,
+                started_at=started_at,
+                ended_at=ended_at,
             )
 
             return response
@@ -240,40 +239,88 @@ class OpenAIClient:
             raise
 
         except Exception as error:
-
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+            ended_at = datetime.now(timezone.utc)
 
-            if llm_span:
-                llm_span.metadata.update(
-                    {
-                        "error": True,
-                        "error_type": type(error).__name__,
-                    }
-                )
-
-                llm_span.__exit__(
-                    type(error),
-                    error,
-                    error.__traceback__,
-                )
-
-                llm_span = None
-
-            self.controlplane.trace(
-                provider="openai",
+            self._record_llm_trace(
+                run=run,
                 model=model,
-                input=input_text,
+                input_text=input_text,
+                output_text=None,
+                input_tokens=None,
+                output_tokens=None,
                 latency_ms=latency_ms,
                 estimated_cost_usd=None,
-                context=context,
-                session_id=session_id,
+                context=trace_context,
                 status="error",
                 safety_flag=False,
                 safety_type=None,
                 safety_action=None,
                 parent_trace_id=parent_trace_id,
+                started_at=started_at,
+                ended_at=ended_at,
+                error=error,
             )
-
             raise
+
+    def _record_llm_trace(
+        self,
+        *,
+        run: Run,
+        model: str,
+        input_text: str,
+        output_text: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        latency_ms: int | None,
+        estimated_cost_usd: float | None,
+        context: str | None,
+        status: str,
+        safety_flag: bool,
+        safety_type: str | None,
+        safety_action: str | None,
+        parent_trace_id: str,
+        started_at: datetime,
+        ended_at: datetime,
+        error: Exception | None = None,
+    ):
+        """
+        Persist one OpenAI request as a child trace of the current
+        application workflow trace.
+
+        This is internal SDK plumbing. The application developer never
+        supplies or creates the trace ID.
+        """
+        payload: dict[str, Any] = {
+            "provider": "openai",
+            "model": model,
+            "input": input_text,
+            "output": output_text,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "latency_ms": latency_ms,
+            "estimated_cost_usd": estimated_cost_usd,
+            "context": context,
+            "status": status,
+            "safety_flag": safety_flag,
+            "safety_type": safety_type,
+            "safety_action": safety_action,
+            "parent_trace_id": parent_trace_id,
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+        }
+
+        if error is not None:
+            payload["output"] = None
+
+        # run._run_id is an SDK-internal server-generated ID. The developer
+        # never chooses or passes it.
+        self.controlplane._post(
+            f"/runs/{run._run_id}/traces",
+            payload,
+        )
+
+
+__all__ = ["OpenAIClient"]

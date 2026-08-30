@@ -2,10 +2,11 @@ import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import httpx
-
+from dotenv import load_dotenv
 from sdk.controlplane.client import ControlPlane
+from sdk.controlplane.openai import OpenAIClient
 
-
+load_dotenv()
 # ============================================================
 # APPLICATION CONFIG
 # ============================================================
@@ -128,6 +129,10 @@ async def main():
     app = controlplane.application(
         APPLICATION_NAME,
         session_id=session_id,
+    )
+
+    openai_client = OpenAIClient(
+        controlplane=controlplane,
     )
 
     print()
@@ -528,13 +533,52 @@ async def main():
             "safety_check": branch_output,
         }
 
+        recommendation_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are the recommendation agent for a weather "
+                    "activity workflow. Give a concise recommendation "
+                    "about whether the user should run outside. Use "
+                    "the supplied weather, air quality, analysis, and "
+                    "safety check. Do not invent measurements."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {prompt}\n\n"
+                    f"Weather: {weather_output}\n"
+                    f"Air quality: {air_output}\n"
+                    f"Analysis: {analysis_output}\n"
+                    f"Safety check: {branch_output}"
+                ),
+            },
+        ]
+
+        llm_response = await asyncio.to_thread(
+            openai_client.chat,
+            model="gpt-4.1-mini",
+            messages=recommendation_messages,
+            context=context,
+            run=run,
+        )
+
+        llm_recommendation = (
+            llm_response.choices[0].message.content or ""
+        ).strip()
+
+        if not llm_recommendation:
+            raise RuntimeError(
+                "OpenAI returned an empty recommendation."
+            )
+
         recommendation_output = {
             "should_run": (
                 branch_output["severity"] == "low"
             ),
-            "recommendation": (
-                branch_output["recommendation"]
-            ),
+            "recommendation": llm_recommendation,
+            "rule_based_safety": branch_output["recommendation"],
         }
 
         recommendation_span = run.span(
@@ -565,7 +609,7 @@ async def main():
             f"{rain} mm rain, "
             f"{wind} km/h wind. "
             f"Air quality AQI: {aqi}. "
-            f"{branch_output['recommendation']}"
+            f"{recommendation_output['recommendation']}"
         )
 
         final_span = run.span(
