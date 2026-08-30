@@ -25,6 +25,14 @@ const [trace, spans] = await Promise.all([
 ]);
 return { trace, spans };
 }
+
+async function apiGetTraceInsights(traceId: string): Promise<ApiInsights | null> {
+try {
+  return await apiGet<ApiInsights>(`/traces/${traceId}/insights`);
+} catch {
+  return null;
+}
+}
 // ─── API Types ────────────────────────────────────────────────────────────────
 interface ApiTrace {
 id: string;
@@ -525,9 +533,12 @@ if (values.length === 0) return null;
 const sorted = [...values].sort((a, b) => a - b);
 return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
 }
+type ShadowEvaluation = NonNullable<ApiInsights["shadow_evaluations"]>[number];
+
 function buildAppGroup(
 application: ApiApplication,
 allTraces: ApiTrace[],
+shadowEvaluations: ShadowEvaluation[] = [],
 ): AppGroup {
 const sessionTraces = allTraces;
 // Root workflow traces correspond to the runs created under this application.
@@ -539,9 +550,42 @@ const successful = rootTraces.filter(t => t.status === "success").length;
 const reliability = rootTraces.length > 0
   ? (successful / rootTraces.length) * 100 : 0;
 
-const evaluatedChildren = childTraces.filter(t => t.factuality_score != null);
-const quality = evaluatedChildren.length > 0
-  ? (evaluatedChildren.reduce((s, t) => s + (t.factuality_score || 0), 0) / evaluatedChildren.length) * 100
+// Use the canonical Shadow evaluation records returned by
+// /traces/:id/insights. This is the same data source used by the Trace
+// Investigation quality pane. Raw child-trace factuality is only a
+// compatibility fallback for older API responses.
+const shadowByTraceId = new Map<string, ShadowEvaluation>();
+for (const evaluation of shadowEvaluations) {
+  if (evaluation.trace_id) shadowByTraceId.set(evaluation.trace_id, evaluation);
+}
+
+const canonicalEvaluations = Array.from(shadowByTraceId.values());
+const fallbackEvaluations: ShadowEvaluation[] = childTraces
+  .filter(t => t.factuality_score != null || t.factuality_status != null)
+  .map(t => ({
+    trace_id: t.id,
+    provider: t.provider,
+    model: t.model,
+    factuality_score: t.factuality_score,
+    factuality_status: t.factuality_status,
+    input: t.input,
+    has_output: t.output != null,
+    context: t.context,
+    input_tokens: t.input_tokens,
+    output_tokens: t.output_tokens,
+    latency_ms: t.latency_ms,
+    estimated_cost_usd: t.estimated_cost_usd,
+    status: t.status,
+    evaluated_at: t.evaluated_at,
+  }));
+
+const evaluations = canonicalEvaluations.length > 0
+  ? canonicalEvaluations
+  : fallbackEvaluations;
+
+const evaluated = evaluations.filter(e => e.factuality_score != null);
+const quality = evaluated.length > 0
+  ? (evaluated.reduce((sum, e) => sum + (e.factuality_score ?? 0), 0) / evaluated.length) * 100
   : null;
 
 const latencies = rootTraces.filter(t => t.latency_ms != null).map(t => t.latency_ms!);
@@ -553,11 +597,11 @@ const totalCost = childTraces.reduce((s, t) => s + (t.estimated_cost_usd || 0), 
 const safetyFlags = sessionTraces.filter(t => t.safety_flag).length;
 
 const shadowCounts = {
-  supported: childTraces.filter(t => t.factuality_status === "supported").length,
-  partial: childTraces.filter(t => t.factuality_status === "partially_supported").length,
-  unsupported: childTraces.filter(t => t.factuality_status === "unsupported").length,
-  pending: childTraces.filter(t => t.factuality_score == null).length,
-  total: childTraces.length,
+  supported: evaluations.filter(e => e.factuality_status === "supported").length,
+  partial: evaluations.filter(e => e.factuality_status === "partially_supported").length,
+  unsupported: evaluations.filter(e => e.factuality_status === "unsupported").length,
+  pending: evaluations.filter(e => e.factuality_score == null).length,
+  total: evaluations.length,
 };
 
 const childTotals = new Map<string, {
@@ -680,7 +724,19 @@ const groups = await Promise.all(
       };
     });
 
-    return buildAppGroup(application, normalized);
+    // Application Quality must use the same canonical Shadow evaluation
+    // endpoint as Trace Investigation. The API exposes this per trace, so
+    // collect the evaluations for each root workflow trace.
+    const rootTraces = normalized.filter(t => t.parent_trace_id === null);
+    const shadowResults = await Promise.all(
+      rootTraces.map(async trace => {
+        const insights = await apiGetTraceInsights(trace.id);
+        return insights?.shadow_evaluations ?? [];
+      })
+    );
+    const shadowEvaluations = shadowResults.flat();
+
+    return buildAppGroup(application, normalized, shadowEvaluations);
   })
 );
 

@@ -920,60 +920,75 @@ def get_trace_insights(trace_id: str):
 
             span_rows = cursor.fetchall()
 
+            # Read persisted Shadow Evaluation results.
+            # The ShadowWorker writes these rows asynchronously after
+            # a successful application run.
             cursor.execute(
                 """
                 SELECT
-                    id,
-                    provider,
-                    model,
-                    input,
-                    output,
-                    context,
-                    input_tokens,
-                    output_tokens,
-                    latency_ms,
-                    estimated_cost_usd,
-                    status
-                FROM traces
-                WHERE parent_trace_id = %s
-                ORDER BY created_at DESC
+                    se.id,
+                    se.trace_id,
+                    se.status,
+                    se.factuality_score,
+                    se.factuality_status,
+                    se.evaluated_at,
+                    se.error,
+                    t.provider,
+                    t.model,
+                    t.input,
+                    t.output,
+                    t.context,
+                    t.input_tokens,
+                    t.output_tokens,
+                    t.latency_ms,
+                    t.estimated_cost_usd
+                FROM shadow_evaluations se
+                JOIN traces t
+                    ON t.id = se.trace_id
+                WHERE t.parent_trace_id = %s
+                ORDER BY se.created_at DESC
                 """,
                 (trace_uuid,),
             )
 
-            child_rows = cursor.fetchall()
+            shadow_rows = cursor.fetchall()
 
-    shadow_evaluations = []
-
-    for row in child_rows:
-        shadow_evaluations.append(
-            {
-                "trace_id": str(row[0]),
-                "provider": row[1],
-                "model": row[2],
-                "input": row[3],
-                "output": row[4],
-                "context": row[5],
-                "input_tokens": row[6],
-                "output_tokens": row[7],
-                "latency_ms": row[8],
-                "estimated_cost_usd": (
-                    float(row[9]) if row[9] is not None else None
-                ),
-                "status": row[10],
-                "factuality_score": None,
-                "factuality_status": None,
-                "evaluated_at": None,
-            }
-        )
+    shadow_evaluations = [
+        {
+            "id": str(row[0]),
+            "trace_id": str(row[1]),
+            "status": row[2],
+            "factuality_score": (
+                float(row[3]) if row[3] is not None else None
+            ),
+            "factuality_status": row[4],
+            "evaluated_at": row[5],
+            "error": row[6],
+            "provider": row[7],
+            "model": row[8],
+            "input": row[9],
+            "output": row[10],
+            "context": row[11],
+            "input_tokens": row[12],
+            "output_tokens": row[13],
+            "latency_ms": row[14],
+            "estimated_cost_usd": (
+                float(row[15]) if row[15] is not None else None
+            ),
+        }
+        for row in shadow_rows
+    ]
 
     evaluated = [
-        item for item in shadow_evaluations
-        if item["factuality_status"] is not None
+        item
+        for item in shadow_evaluations
+        if item["status"] == "completed"
+        and item["factuality_status"] is not None
     ]
 
     scored = [
-        item for item in evaluated
+        item
+        for item in evaluated
         if item["factuality_score"] is not None
     ]
 
@@ -981,16 +996,21 @@ def get_trace_insights(trace_id: str):
         item["factuality_status"] == "supported"
         for item in evaluated
     )
+
     partially_supported = sum(
         item["factuality_status"] == "partially_supported"
         for item in evaluated
     )
+
     unsupported = sum(
         item["factuality_status"] == "unsupported"
         for item in evaluated
     )
 
-    pending = len(shadow_evaluations) - len(evaluated)
+    pending = sum(
+        item["status"] in {"pending", "running"}
+        for item in shadow_evaluations
+    )
 
     average_score = (
         round(
