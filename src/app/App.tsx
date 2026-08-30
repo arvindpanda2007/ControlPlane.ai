@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+
 import {
 Search, Settings, Activity, BarChart2, DollarSign, Shield,
 AlertTriangle, ChevronRight, ChevronLeft, X, Plus, Minus,
@@ -1390,7 +1390,7 @@ return {};
 : (rawMetadata as Record<string, unknown>);
 const isBottleneck = insights?.performance?.bottleneck?.span_id === node.id;
 const shadow = insights?.shadow;
-const tabs = ["overview", "input", "context", "output", "quality"];
+const tabs = isRootNode ? ["overview", "input", "context", "output", "quality"] : ["overview", "input", "context", "output"];
 const toDisplayValue = (value: unknown): string | null => {
 if (value == null || value === "") return null;
 if (typeof value === "string") return value;
@@ -1621,7 +1621,7 @@ style={{ background: KIND_COLOR[node.kind] + "22", color: KIND_COLOR[node.kind] 
       )
     )}
 
-    {tab === "quality" && (
+    {tab === "quality" && isRootNode && (
       <ShadowQualityPane shadow={shadow} shadowEvals={insights?.shadow_evaluations ?? []} />
     )}
   </div>
@@ -1797,15 +1797,6 @@ return (
     </div>
   )}
 
-  <div>
-    <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">Detailed Dimensions</div>
-    {["Grounding", "Relevance", "Completeness", "Flow Accuracy", "Safety"].map(m => (
-      <div key={m} className="flex justify-between py-1.5 border-b border-cp-border/50 text-xs last:border-0">
-        <span className="text-cp-secondary">{m}</span>
-        <span className="text-cp-muted">N/A</span>
-      </div>
-    ))}
-  </div>
 </div>
 
 );
@@ -2004,9 +1995,8 @@ return (
                     {ev.factuality_status.replace(/_/g, " ")}
                   </span>
                 )}
-                {ev.input && (
-                  <div className="text-xs text-cp-muted truncate">{ev.input.slice(0, 60)}{ev.input.length > 60 ? "…" : ""}</div>
-                )}
+                {/* Do not render evaluation input here: it may contain the evaluator/system prompt.
+                    The overview should expose evaluation status and quality data, not prompt internals. */}
               </div>
             );
           })}
@@ -2363,7 +2353,8 @@ const lo = latencyBuckets[i - 1] || 0;
 return ms >= lo && ms < latencyBuckets[i];
 }).length,
 }));
-// Use shadowCounts from AppGroup — child Shadow traces are the ones with factuality data.
+// Shadow quality is derived from child evaluation traces. Keep this view
+// factuality-only; the API does not expose separate grounding/relevance/etc.
 const qualityData = [
 { name: "Supported", value: app.shadowCounts.supported, color: "#16a34a" },
 { name: "Partial", value: app.shadowCounts.partial, color: "#d97706" },
@@ -2729,15 +2720,6 @@ return (
           </div>
         )}
 
-        <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
-          <div className="text-sm font-medium text-cp-text mb-3">Detailed Quality Metrics</div>
-          {["Grounding", "Relevance", "Completeness", "Flow Accuracy", "Safety"].map(m => (
-            <div key={m} className="flex justify-between py-2 border-b border-cp-border/50 text-xs last:border-0">
-              <span className="text-cp-secondary">{m}</span>
-              <span className="text-cp-muted">N/A</span>
-            </div>
-          ))}
-        </div>
       </div>
     )}
 
@@ -3138,4 +3120,3 @@ onSelectTrace={handleSelectTrace}
 );
 }
 return <ApplicationsHome onSelectApp={handleSelectApp} />;
-}
