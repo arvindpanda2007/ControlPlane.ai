@@ -16,8 +16,10 @@ from .safety import SafetyViolation, check_output
 def _serialize_context(value: Any) -> str | None:
     if value is None:
         return None
+
     if isinstance(value, str):
         return value
+
     try:
         return json.dumps(value, default=str)
     except (TypeError, ValueError):
@@ -73,6 +75,7 @@ class OpenAIClient:
         `trace` is retained as a compatibility alias for older application
         code, but it must still be a Run object returned by app.run().
         """
+
         if run is None:
             run = trace
 
@@ -98,6 +101,7 @@ class OpenAIClient:
 
         trace_context = _serialize_context(context)
 
+        # Internal SDK state. The developer never supplies this ID.
         parent_trace_id = run._trace_id
 
         if not parent_trace_id:
@@ -116,6 +120,7 @@ class OpenAIClient:
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+
             ended_at = datetime.now(timezone.utc)
 
             self._record_llm_trace(
@@ -136,6 +141,7 @@ class OpenAIClient:
                 started_at=started_at,
                 ended_at=ended_at,
             )
+
             raise
 
         # ---------------------------------------------------------
@@ -151,6 +157,7 @@ class OpenAIClient:
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+
             ended_at = datetime.now(timezone.utc)
 
             # -----------------------------------------------------
@@ -208,6 +215,7 @@ class OpenAIClient:
                     started_at=started_at,
                     ended_at=ended_at,
                 )
+
                 raise
 
             # -----------------------------------------------------
@@ -242,6 +250,7 @@ class OpenAIClient:
             latency_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
+
             ended_at = datetime.now(timezone.utc)
 
             self._record_llm_trace(
@@ -263,7 +272,12 @@ class OpenAIClient:
                 ended_at=ended_at,
                 error=error,
             )
+
             raise
+
+    # =========================================================
+    # INTERNAL CONTROLPLANE LLM TRACE RECORDING
+    # =========================================================
 
     def _record_llm_trace(
         self,
@@ -293,6 +307,7 @@ class OpenAIClient:
         This is internal SDK plumbing. The application developer never
         supplies or creates the trace ID.
         """
+
         payload: dict[str, Any] = {
             "provider": "openai",
             "model": model,
@@ -303,6 +318,7 @@ class OpenAIClient:
             "latency_ms": latency_ms,
             "estimated_cost_usd": estimated_cost_usd,
             "context": context,
+            "session_id": run._session_id,
             "status": status,
             "safety_flag": safety_flag,
             "safety_type": safety_type,
@@ -315,11 +331,11 @@ class OpenAIClient:
         if error is not None:
             payload["output"] = None
 
-        # run._run_id is an SDK-internal server-generated ID. The developer
-        # never chooses or passes it.
-        self.controlplane._post(
-            f"/runs/{run._run_id}/traces",
-            payload,
+        # Use the SDK's internal child-trace helper.
+        # The server creates the actual trace ID.
+        self.controlplane._create_trace(
+            run_id=run._run_id,
+            **payload,
         )
 
 

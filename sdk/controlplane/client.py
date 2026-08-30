@@ -11,6 +11,7 @@ import json
 def _serialize_context(value):
     if value is None or isinstance(value, str):
         return value
+
     try:
         return json.dumps(value, default=str)
     except (TypeError, ValueError):
@@ -99,6 +100,7 @@ class Run:
         )
 
         trace_id = data.get("trace_id") or data.get("id")
+
         if not trace_id:
             raise RuntimeError(
                 "ControlPlane did not return the internal run trace ID."
@@ -127,9 +129,12 @@ class Run:
                 try:
                     start_dt = datetime.fromisoformat(started)
                     end_dt = datetime.fromisoformat(self._ended_at)
+
                     latency_ms = max(
                         0,
-                        int((end_dt - start_dt).total_seconds() * 1000),
+                        int(
+                            (end_dt - start_dt).total_seconds() * 1000
+                        ),
                     )
                 except Exception:
                     latency_ms = None
@@ -164,6 +169,7 @@ class Run:
         `parent` accepts a Span handle, never a parent span ID.
         ControlPlane generates the actual span ID.
         """
+
         if self._trace_id is None:
             raise RuntimeError(
                 "Run must be entered with 'with app.run(...) as run:' "
@@ -187,6 +193,7 @@ class Run:
         )
 
         span_id = data.get("span_id") or data.get("id")
+
         if not span_id:
             raise RuntimeError(
                 f"ControlPlane did not return a span ID for {name!r}."
@@ -231,6 +238,7 @@ class Run:
         response = self._controlplane._get(
             f"/traces/{self._trace_id}/spans"
         )
+
         return response
 
 
@@ -273,6 +281,7 @@ class Application:
                 print()
                 print("ControlPlane application setup")
                 print("-" * 70)
+
                 session_id = input("Project/session ID: ").strip()
 
                 if not session_id:
@@ -281,6 +290,7 @@ class Application:
                     )
 
                 self.session_id = session_id
+
             else:
                 raise ValueError(
                     "session_id is required. Provide session_id when "
@@ -353,7 +363,9 @@ class ControlPlane:
             json=payload,
             timeout=5.0,
         )
+
         response.raise_for_status()
+
         return response.json() if response.content else {}
 
     def _get(self, path: str):
@@ -361,7 +373,9 @@ class ControlPlane:
             f"{self.api_url}{path}",
             timeout=5.0,
         )
+
         response.raise_for_status()
+
         return response.json()
 
     def _patch(self, path: str, payload: dict):
@@ -370,10 +384,17 @@ class ControlPlane:
             json=payload,
             timeout=5.0,
         )
+
         response.raise_for_status()
+
         return response.json() if response.content else {}
 
-    def _create_application(self, *, name: str, session_id: str) -> str:
+    def _create_application(
+        self,
+        *,
+        name: str,
+        session_id: str,
+    ) -> str:
         data = self._post(
             "/applications",
             {
@@ -382,7 +403,11 @@ class ControlPlane:
             },
         )
 
-        application_id = data.get("application_id") or data.get("id")
+        application_id = (
+            data.get("application_id")
+            or data.get("id")
+        )
+
         if not application_id:
             raise RuntimeError(
                 "ControlPlane did not return an application ID."
@@ -410,12 +435,65 @@ class ControlPlane:
         )
 
         run_id = data.get("run_id") or data.get("id")
+
         if not run_id:
             raise RuntimeError(
                 "ControlPlane did not return a run ID."
             )
 
         return str(run_id)
+
+    def _create_trace(
+        self,
+        *,
+        run_id: str,
+        provider: str,
+        model: str,
+        input: str,
+        output: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+        estimated_cost_usd: float | None = None,
+        context: str | None = None,
+        session_id: str | None = None,
+        status: str = "success",
+        safety_flag: bool = False,
+        safety_type: str | None = None,
+        safety_action: str | None = None,
+        parent_trace_id: str | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+    ):
+        """
+        Create a child trace.
+
+        The server generates the trace ID. Application developers never
+        provide one.
+        """
+
+        return self._post(
+            f"/runs/{run_id}/traces",
+            {
+                "provider": provider,
+                "model": model,
+                "input": input,
+                "output": output,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "latency_ms": latency_ms,
+                "estimated_cost_usd": estimated_cost_usd,
+                "context": context,
+                "session_id": session_id,
+                "status": status,
+                "safety_flag": safety_flag,
+                "safety_type": safety_type,
+                "safety_action": safety_action,
+                "parent_trace_id": parent_trace_id,
+                "started_at": started_at,
+                "ended_at": ended_at,
+            },
+        )
 
     def _create_run_trace(
         self,
@@ -432,7 +510,11 @@ class ControlPlane:
             {
                 "provider": "controlplane",
                 "model": "workflow",
-                "input": str(input) if input is not None else application_name,
+                "input": (
+                    str(input)
+                    if input is not None
+                    else application_name
+                ),
                 "output": None,
                 "context": _serialize_context(context),
                 "session_id": session_id,
@@ -487,6 +569,7 @@ class ControlPlane:
 
         if started_at is not None:
             payload["started_at"] = started_at
+
         if ended_at is not None:
             payload["ended_at"] = ended_at
 
