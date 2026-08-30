@@ -1,4 +1,4 @@
-
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
 Search, Settings, Activity, BarChart2, DollarSign, Shield,
 AlertTriangle, ChevronRight, ChevronLeft, X, Plus, Minus,
@@ -3120,3 +3120,4 @@ onSelectTrace={handleSelectTrace}
 );
 }
 return <ApplicationsHome onSelectApp={handleSelectApp} />;
+}
