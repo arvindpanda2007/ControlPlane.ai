@@ -255,6 +255,7 @@ lastActivity: string | null;
 health: "healthy" | "warning" | "critical";
 // Shadow evaluation counts (from child traces).
 shadowCounts: { supported: number; partial: number; unsupported: number; pending: number; total: number };
+  shadowEvaluations: AppShadowEvaluation[];
 }
 // ─── Constants ────────────────────────────────────────────────────────────────
 const NODE_W = 186;
@@ -536,6 +537,12 @@ return sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
 }
 type ShadowEvaluation = NonNullable<ApiInsights["shadow_evaluations"]>[number];
 
+type AppShadowEvaluation = ShadowEvaluation & {
+  // Shadow evaluations are child traces. Keep the owning workflow trace ID
+  // for application-level display and navigation.
+  application_trace_id?: string;
+};
+
 function buildAppGroup(
 application: ApiApplication,
 allTraces: ApiTrace[],
@@ -584,16 +591,41 @@ const reliability = operationalRootTraces.length > 0
 // /traces/:id/insights. This is the same data source used by the Trace
 // Investigation quality pane. Raw child-trace factuality is only a
 // compatibility fallback for older API responses.
-const shadowByTraceId = new Map<string, ShadowEvaluation>();
+// Shadow evaluation records use the child evaluation trace ID. That ID is
+// different from the real application/workflow trace ID shown in the Traces
+// and Reliability tabs. Resolve the evaluation back to its owning root trace
+// entirely in the frontend; no backend change is required.
+const traceById = new Map(sessionTraces.map(t => [t.id, t]));
+const rootTraceIdFor = (traceId: string): string | undefined => {
+  let currentId: string | null = traceId;
+  const visited = new Set<string>();
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const trace = traceById.get(currentId);
+    if (!trace) return undefined;
+    if (!trace.parent_trace_id) return trace.id;
+    currentId = trace.parent_trace_id;
+  }
+
+  return undefined;
+};
+
+const shadowByTraceId = new Map<string, AppShadowEvaluation>();
 for (const evaluation of shadowEvaluations) {
-  if (evaluation.trace_id) shadowByTraceId.set(evaluation.trace_id, evaluation);
+  if (!evaluation.trace_id) continue;
+  shadowByTraceId.set(evaluation.trace_id, {
+    ...evaluation,
+    application_trace_id: rootTraceIdFor(evaluation.trace_id),
+  });
 }
 
 const canonicalEvaluations = Array.from(shadowByTraceId.values());
-const fallbackEvaluations: ShadowEvaluation[] = childTraces
+const fallbackEvaluations: AppShadowEvaluation[] = childTraces
   .filter(t => t.factuality_score != null || t.factuality_status != null)
   .map(t => ({
     trace_id: t.id,
+    application_trace_id: rootTraceIdFor(t.id),
     provider: t.provider,
     model: t.model,
     factuality_score: t.factuality_score,
@@ -715,6 +747,7 @@ return {
   lastActivity,
   health,
   shadowCounts,
+  shadowEvaluations: evaluations,
 };
 }
 
@@ -2800,50 +2833,283 @@ return (
     {/* QUALITY */}
     {tab === "quality" && (
       <div className="space-y-6">
-        <div className="grid grid-cols-2 gap-4">
-          <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
-            <div className="text-xs text-cp-muted mb-1">Average Factuality</div>
-            <div className="text-3xl font-bold font-mono" style={{
-              color: app.quality == null ? "#9e9e9b"
-                : app.quality >= 90 ? "#16a34a" : app.quality >= 80 ? "#d97706" : "#dc2626"
-            }}>
-              {app.quality != null ? `${app.quality.toFixed(0)}%` : "N/A"}
-            </div>
-          </div>
-          <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
-            <div className="text-xs text-cp-muted mb-1">Evaluated Traces</div>
-            <div className="text-3xl font-bold font-mono text-cp-text">
-              {app.shadowCounts.total - app.shadowCounts.pending} / {app.shadowCounts.total}
-            </div>
-          </div>
-        </div>
+        {(() => {
+          const evaluations = app.shadowEvaluations.filter(
+            e => e.factuality_score != null
+          );
+          const evaluatedCount = evaluations.length;
+          const totalCount = app.shadowEvaluations.length;
+          const averageScore = evaluatedCount > 0
+            ? evaluations.reduce((sum, e) => sum + (e.factuality_score ?? 0), 0) / evaluatedCount
+            : null;
+          const lostPoints = averageScore != null
+            ? Math.max(0, (1 - averageScore) * 100)
+            : null;
 
-        {qualityData.length > 0 && (
-          <div className="bg-cp-surface border border-cp-border rounded-lg p-4">
-            <div className="text-sm font-medium text-cp-text mb-4">Shadow Evaluation Distribution</div>
-            <div className="flex gap-8 items-center">
-              <PieChart width={180} height={180}>
-                <Pie data={qualityData} dataKey="value" cx="50%" cy="50%"
-                  innerRadius={50} outerRadius={75} paddingAngle={2}>
-                  {qualityData.map((entry, i) => <Cell key={`qd-${i}`} fill={entry.color} />)}
-                </Pie>
-              </PieChart>
-              <div className="space-y-2">
-                {qualityData.map(d => (
-                  <div key={d.name} className="flex items-center gap-2 text-xs">
-                    <span className="w-2 h-2 rounded-full" style={{ background: d.color }} />
-                    <span className="text-cp-secondary w-20">{d.name}</span>
-                    <span className="font-mono text-cp-text">{d.value}</span>
+          const belowPerfect = evaluations
+            .filter(e => (e.factuality_score ?? 1) < 1)
+            .sort((a, b) => (a.factuality_score ?? 0) - (b.factuality_score ?? 0));
+
+          // The API may not provide factuality_status. In that case, derive
+          // display buckets directly from the numerical factuality score:
+          // 100% = supported, 1-99% = partially supported, 0% = unsupported.
+          const factualityBuckets = evaluations.reduce(
+            (counts, e) => {
+              const score = e.factuality_score ?? 0;
+              if (score >= 1) counts.supported += 1;
+              else if (score <= 0) counts.unsupported += 1;
+              else counts.partial += 1;
+              return counts;
+            },
+            { supported: 0, partial: 0, unsupported: 0 }
+          );
+
+          const scoreLabel =
+            averageScore == null ? "Not evaluated" :
+            averageScore >= 0.9 ? "Strong factuality" :
+            averageScore >= 0.8 ? "Generally reliable" :
+            averageScore >= 0.6 ? "Needs review" :
+            "Poor factuality";
+
+          return (
+            <>
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-5">
+                <div className="flex items-start justify-between gap-8">
+                  <div className="flex-1">
+                    <div className="text-xs text-cp-muted uppercase tracking-wider mb-2">
+                      Factuality
+                    </div>
+                    <div className="flex items-baseline gap-3">
+                      <div className="text-4xl font-bold font-mono" style={{
+                        color: averageScore == null ? "#9e9e9b"
+                          : averageScore >= 0.9 ? "#16a34a"
+                          : averageScore >= 0.8 ? "#d97706"
+                          : "#dc2626"
+                      }}>
+                        {averageScore != null ? `${(averageScore * 100).toFixed(0)}%` : "N/A"}
+                      </div>
+                      <span className="text-sm font-medium text-cp-secondary">
+                        {scoreLabel}
+                      </span>
+                    </div>
+                    <p className="text-xs text-cp-secondary leading-5 mt-2 max-w-3xl">
+                      Shadow evaluated {evaluatedCount} response{evaluatedCount === 1 ? "" : "s"}.
+                      The headline score is the average of those individual factuality scores.
+                    </p>
                   </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
 
+                  <div className="w-48 flex-shrink-0">
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-cp-muted">Evaluated</span>
+                      <span className="font-mono text-cp-text">
+                        {evaluatedCount} / {totalCount}
+                      </span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-cp-elevated overflow-hidden">
+                      <div
+                        className="h-full rounded-full"
+                        style={{
+                          width: `${totalCount > 0 ? (evaluatedCount / totalCount) * 100 : 0}%`,
+                          background: "#2563eb"
+                        }}
+                      />
+                    </div>
+                    {app.shadowCounts.pending > 0 && (
+                      <div className="text-xs text-cp-muted mt-1">
+                        {app.shadowCounts.pending} pending
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-5">
+                <div className="flex items-center justify-between gap-6">
+                  <div>
+                    <div className="text-sm font-medium text-cp-text">
+                      Why is the score {averageScore != null ? `${(averageScore * 100).toFixed(0)}%` : "N/A"}?
+                    </div>
+                    <div className="text-xs text-cp-muted mt-1">
+                      These rows show the application traces behind the headline average. Each row represents one evaluated agent response, with its application trace ID and factuality result.
+                    </div>
+                  </div>
+                  {lostPoints != null && (
+                    <div className="text-right">
+                      <div className="text-xs text-cp-muted">Gap from 100%</div>
+                      <div className="text-lg font-bold font-mono text-cp-text">
+                        {lostPoints.toFixed(0)} pts
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {evaluations.length === 0 ? (
+                  <div className="mt-4 rounded-lg border border-cp-border bg-cp-elevated p-4 text-xs text-cp-secondary">
+                    No completed factuality scores are available.
+                  </div>
+                ) : belowPerfect.length === 0 ? (
+                  <div className="mt-4 rounded-lg border border-cp-border bg-cp-elevated p-4 text-xs text-cp-secondary">
+                    Every completed evaluation scored 100%, so the average is 100%.
+                  </div>
+                ) : (
+                  <div className="mt-4 space-y-2">
+                    {belowPerfect.map((ev, index) => {
+                      const score = ev.factuality_score ?? 0;
+                      const gap = Math.max(0, (1 - score) * 100);
+                      // Keep the displayed bucket consistent with the numerical score.
+                      // Shadow status can be absent or use a non-factuality label such as
+                      // "not_applicable", so the score remains the source of truth here.
+                      const status = score >= 1
+                        ? "Supported"
+                        : score <= 0
+                          ? "Unsupported"
+                          : "Partially supported";
+                      const shadowTraceId = ev.trace_id;
+                      const traceId = ev.application_trace_id || ev.trace_id;
+                      const canOpenTrace = Boolean(ev.application_trace_id);
+
+                      return (
+                        <button
+                          type="button"
+                          key={`${ev.trace_id}-${index}`}
+                          onClick={() => {
+                            if (canOpenTrace) onSelectTrace(traceId);
+                          }}
+                          disabled={!canOpenTrace}
+                          className={`w-full text-left rounded-lg border border-cp-border bg-cp-elevated p-3 ${
+                            canOpenTrace ? "hover:bg-cp-hover transition-colors cursor-pointer" : "cursor-default"
+                          }`}
+                          title={
+                            canOpenTrace
+                              ? `Open application trace ${traceId}`
+                              : `Shadow evaluation ${shadowTraceId}`
+                          }
+                        >
+                          <div className="flex items-center justify-between gap-4">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-mono text-cp-muted">
+                                  Trace ID
+                                </span>
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-cp-app text-cp-secondary">
+                                  {status}
+                                </span>
+                              </div>
+                              <div
+                                className="text-xs text-cp-secondary mt-1 font-mono truncate"
+                                title={traceId}
+                              >
+                                {traceId}
+                              </div>
+                              {!canOpenTrace && (
+                                <div className="text-[10px] text-cp-muted mt-1">
+                                  Application trace unavailable for this evaluation.
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-3 flex-shrink-0">
+                              <div className="w-28 h-1.5 rounded-full bg-cp-app overflow-hidden">
+                                <div
+                                  className="h-full rounded-full"
+                                  style={{
+                                    width: `${score * 100}%`,
+                                    background: score >= 0.8 ? "#16a34a"
+                                      : score >= 0.6 ? "#d97706"
+                                      : "#dc2626"
+                                  }}
+                                />
+                              </div>
+                              <div className="text-right w-16">
+                                <div className="text-sm font-bold font-mono text-cp-text">
+                                  {(score * 100).toFixed(0)}%
+                                </div>
+                                <div className="text-[10px] text-cp-muted">
+                                  −{gap.toFixed(0)} pts
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {belowPerfect.length > 0 && (
+                  <div className="mt-4 text-xs text-cp-muted">
+                    Lower-scoring evaluations are shown first. Their individual scores
+                    are what pull the application average below 100%.
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-5">
+                <div className="text-sm font-medium text-cp-text mb-1">
+                  How to interpret factuality
+                </div>
+                <div className="text-xs text-cp-secondary leading-5">
+                  Factuality is Shadow's assessment of whether an agent response is
+                  supported by the information available to the evaluation. It is a
+                  quality signal, not a guarantee of correctness.
+                </div>
+
+                <div className="grid grid-cols-3 gap-3 mt-4">
+                  <div className="rounded-lg border border-cp-border bg-cp-elevated p-3">
+                    <div className="text-xs font-medium text-cp-text">Supported</div>
+                    <div className="text-lg font-bold font-mono text-cp-text mt-1">
+                      {factualityBuckets.supported}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-cp-border bg-cp-elevated p-3">
+                    <div className="text-xs font-medium text-cp-text">Partially supported</div>
+                    <div className="text-lg font-bold font-mono text-cp-text mt-1">
+                      {factualityBuckets.partial}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-cp-border bg-cp-elevated p-3">
+                    <div className="text-xs font-medium text-cp-text">Unsupported</div>
+                    <div className="text-lg font-bold font-mono text-cp-text mt-1">
+                      {factualityBuckets.unsupported}
+                    </div>
+                  </div>
+                </div>
+
+                {evaluatedCount > 0 && (
+                  <div className="mt-3 text-xs text-cp-muted">
+                    These buckets are derived from the numerical Shadow factuality scores:
+                    100% is supported, 1–99% is partially supported, and 0% is unsupported.
+                    The numerical scores remain the source of truth for the headline average.
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-cp-surface border border-cp-border rounded-lg p-5">
+                <div className="text-sm font-medium text-cp-text mb-2">
+                  What to investigate
+                </div>
+                {belowPerfect.length > 0 ? (
+                  <div className="text-xs text-cp-secondary leading-5">
+                    Start with the lowest-scoring evaluation above. Open its trace and
+                    compare the agent response with the evidence available to it.
+                    That is where the lost points are coming from.
+                  </div>
+                ) : evaluatedCount > 0 ? (
+                  <div className="text-xs text-cp-secondary leading-5">
+                    Every completed evaluation is 100%. If the headline score is not
+                    100%, the score and evaluation set are inconsistent and should be refreshed.
+                  </div>
+                ) : (
+                  <div className="text-xs text-cp-secondary leading-5">
+                    There are no completed factuality evaluations yet.
+                  </div>
+                )}
+              </div>
+            </>
+          );
+        })()}
       </div>
     )}
-
     {/* COST */}
     {tab === "cost" && (
       <div className="space-y-6">
