@@ -2084,7 +2084,9 @@ const loadTrace = async (showLoading = false) => {
 
   try {
     const d = await apiGetTraceDetail(traceId);
-    const ins: ApiInsights | null = null;
+    const ins: ApiInsights | null = await apiGet<ApiInsights>(
+      `/traces/${traceId}/insights`
+    ).catch(() => null);
     const resolvedRunId = d.trace?.run_id || sessionTraces.find(t => t.id === traceId)?.run_id;
     const freshTraces = resolvedRunId
       ? await apiGet<ApiTrace[]>(`/runs/${resolvedRunId}/traces?limit=2000`).catch(() => [])

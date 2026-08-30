@@ -869,6 +869,235 @@ def get_trace(trace_id: str):
 
 
 # ============================================================
+# TRACE INSIGHTS
+# ============================================================
+
+@app.get("/traces/{trace_id}/insights")
+def get_trace_insights(trace_id: str):
+    trace_uuid = uuid(trace_id, "trace ID")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    provider,
+                    model,
+                    latency_ms,
+                    estimated_cost_usd,
+                    status,
+                    parent_trace_id
+                FROM traces
+                WHERE id = %s
+                """,
+                (trace_uuid,),
+            )
+
+            trace_row = cursor.fetchone()
+
+            if trace_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Trace not found.",
+                )
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    span_type,
+                    duration_ms,
+                    status
+                FROM spans
+                WHERE trace_id = %s
+                  AND duration_ms IS NOT NULL
+                ORDER BY duration_ms DESC
+                """,
+                (trace_uuid,),
+            )
+
+            span_rows = cursor.fetchall()
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    provider,
+                    model,
+                    input,
+                    output,
+                    context,
+                    input_tokens,
+                    output_tokens,
+                    latency_ms,
+                    estimated_cost_usd,
+                    status
+                FROM traces
+                WHERE parent_trace_id = %s
+                ORDER BY created_at DESC
+                """,
+                (trace_uuid,),
+            )
+
+            child_rows = cursor.fetchall()
+
+    shadow_evaluations = []
+
+    for row in child_rows:
+        shadow_evaluations.append(
+            {
+                "trace_id": str(row[0]),
+                "provider": row[1],
+                "model": row[2],
+                "input": row[3],
+                "output": row[4],
+                "context": row[5],
+                "input_tokens": row[6],
+                "output_tokens": row[7],
+                "latency_ms": row[8],
+                "estimated_cost_usd": (
+                    float(row[9]) if row[9] is not None else None
+                ),
+                "status": row[10],
+                "factuality_score": None,
+                "factuality_status": None,
+                "evaluated_at": None,
+            }
+        )
+
+    evaluated = [
+        item for item in shadow_evaluations
+        if item["factuality_status"] is not None
+    ]
+
+    scored = [
+        item for item in evaluated
+        if item["factuality_score"] is not None
+    ]
+
+    supported = sum(
+        item["factuality_status"] == "supported"
+        for item in evaluated
+    )
+    partially_supported = sum(
+        item["factuality_status"] == "partially_supported"
+        for item in evaluated
+    )
+    unsupported = sum(
+        item["factuality_status"] == "unsupported"
+        for item in evaluated
+    )
+
+    pending = len(shadow_evaluations) - len(evaluated)
+
+    average_score = (
+        round(
+            sum(item["factuality_score"] for item in scored)
+            / len(scored),
+            3,
+        )
+        if scored
+        else None
+    )
+
+    bottleneck = None
+
+    if span_rows:
+        row = span_rows[0]
+        total_duration = sum(
+            (item[3] or 0) for item in span_rows
+        )
+
+        bottleneck = {
+            "span_id": str(row[0]),
+            "name": row[1],
+            "span_type": row[2],
+            "duration_ms": row[3] or 0,
+            "latency_share": round(
+                ((row[3] or 0) / total_duration * 100)
+                if total_duration
+                else 0,
+                2,
+            ),
+            "status": row[4],
+        }
+
+    performance_recommendations = []
+
+    if bottleneck:
+        if bottleneck["span_type"] == "llm":
+            performance_recommendations.extend(
+                [
+                    "Consider reducing prompt size or unnecessary context.",
+                    "Consider using a faster model when response quality permits.",
+                    "Consider caching reusable context or repeated requests.",
+                ]
+            )
+        else:
+            performance_recommendations.append(
+                "Inspect the slowest span for latency optimization opportunities."
+            )
+
+    quality_recommendations = []
+
+    if unsupported:
+        quality_recommendations.append(
+            "Shadow evaluation found an unsupported response."
+        )
+
+    if partially_supported:
+        quality_recommendations.append(
+            "Shadow evaluation found a partially supported response."
+        )
+
+    if supported and not quality_recommendations:
+        quality_recommendations.append(
+            "Shadow evaluation found the response supported by the provided context."
+        )
+
+    if pending:
+        quality_recommendations.append(
+            "Shadow evaluation is pending."
+        )
+
+    return {
+        "trace_id": str(trace_uuid),
+        "summary": (
+            "Workflow completed successfully."
+            if trace_row[5] == "success"
+            else f"Workflow status: {trace_row[5]}."
+        ),
+        "performance": {
+            "workflow_latency_ms": trace_row[3],
+            "cost_usd": (
+                float(trace_row[4])
+                if trace_row[4] is not None
+                else None
+            ),
+            "bottleneck": bottleneck,
+        },
+        "shadow": {
+            "evaluations": len(shadow_evaluations),
+            "evaluated": len(evaluated),
+            "average_factuality_score": average_score,
+            "supported": supported,
+            "partially_supported": partially_supported,
+            "unsupported": unsupported,
+            "pending": pending,
+        },
+        "shadow_evaluations": shadow_evaluations,
+        "recommendations": (
+            performance_recommendations
+            + quality_recommendations
+        ),
+        "performance_recommendations": performance_recommendations,
+        "quality_recommendations": quality_recommendations,
+    }
+
+
+# ============================================================
 # SPANS
 # ============================================================
 

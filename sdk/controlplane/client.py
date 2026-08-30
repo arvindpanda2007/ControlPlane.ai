@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import json
+import uuid
 
 
 def _serialize_context(value):
@@ -341,6 +342,7 @@ class ControlPlane:
     ):
         self.api_url = api_url.rstrip("/")
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self._shadow_worker = None
 
     def application(
         self,
@@ -442,6 +444,113 @@ class ControlPlane:
             )
 
         return str(run_id)
+
+    def trace(
+        self,
+        *,
+        provider: str,
+        model: str,
+        input: str,
+        output: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        latency_ms: int | None = None,
+        estimated_cost_usd: float | None = None,
+        context: str | None = None,
+        session_id: str | None = None,
+        status: str = "success",
+        safety_flag: bool = False,
+        safety_type: str | None = None,
+        safety_action: str | None = None,
+        parent_trace_id: str | None = None,
+    ):
+        """
+        Record an LLM trace and asynchronously run Shadow evaluation.
+
+        The trace is persisted synchronously so token usage, cost, output,
+        and the trace ID are available to the backend immediately.
+        Shadow runs only after the trace has been successfully stored.
+        """
+
+        trace_id = str(uuid.uuid4())
+
+        payload = {
+            "id": trace_id,
+            "provider": provider,
+            "model": model,
+            "input": input,
+            "output": output,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "latency_ms": latency_ms,
+            "estimated_cost_usd": estimated_cost_usd,
+            "context": context,
+            "session_id": session_id,
+            "status": status,
+            "safety_flag": safety_flag,
+            "safety_type": safety_type,
+            "safety_action": safety_action,
+            "parent_trace_id": parent_trace_id,
+        }
+
+        # Persist the LLM trace before dispatching Shadow.
+        self._send_llm_trace(payload)
+
+        # Shadow must run after the trace exists in the database.
+        if (
+            status == "success"
+            and context
+            and output
+        ):
+            self._executor.submit(
+                self._run_shadow_evaluation,
+                trace_id,
+            )
+
+        return trace_id
+
+    def _send_llm_trace(
+        self,
+        payload: dict,
+    ):
+        """Persist an LLM trace immediately."""
+        response = httpx.post(
+            f"{self.api_url}/traces",
+            json=payload,
+            timeout=5.0,
+        )
+
+        response.raise_for_status()
+
+        print(
+            "LLM TRACE STORED:",
+            payload["id"],
+        )
+
+    def _run_shadow_evaluation(
+        self,
+        trace_id: str,
+    ):
+        """Run Shadow asynchronously after the trace is persisted."""
+        try:
+            if self._shadow_worker is None:
+                from .shadow.worker import ShadowWorker
+
+                self._shadow_worker = ShadowWorker()
+
+            self._shadow_worker.evaluate_trace(
+                trace_id
+            )
+
+            print(
+                "SHADOW EVALUATION COMPLETE:",
+                trace_id,
+            )
+
+        except Exception as error:
+            print(
+                f"ControlPlane shadow evaluation failed: {error}"
+            )
 
     def _create_trace(
         self,
