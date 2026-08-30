@@ -1,5 +1,3 @@
-
-
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
@@ -46,7 +44,7 @@ class Run:
 
     Developer contract:
 
-        app = cp.application("Weather Agent", session_id="messi")
+        app = cp.application("Weather Agent")
 
         with app.run(input="...", context={...}) as run:
             root = run.span(...)
@@ -62,7 +60,6 @@ class Run:
         application_id: str,
         run_id: str,
         application_name: str,
-        session_id: str,
         input: Any = None,
         context: Any = None,
     ):
@@ -70,7 +67,6 @@ class Run:
         self._application_id = str(application_id)
         self._run_id = str(run_id)
         self._application_name = application_name
-        self._session_id = session_id
         self._input = input
         self._context = context
 
@@ -95,7 +91,6 @@ class Run:
         data = self._controlplane._create_run_trace(
             run_id=self._run_id,
             application_name=self._application_name,
-            session_id=self._session_id,
             input=self._input,
             context=self._context,
         )
@@ -264,7 +259,6 @@ class Application:
         self,
         controlplane: "ControlPlane",
         name: str,
-        session_id: str | None = None,
     ):
         name = name.strip()
 
@@ -273,7 +267,6 @@ class Application:
 
         self._controlplane = controlplane
         self.name = name
-        self.session_id = session_id.strip() if session_id else None
         self._application_id: str | None = None
 
     def run(
@@ -282,35 +275,9 @@ class Application:
         input: Any = None,
         context: Any = None,
     ) -> Run:
-        session_id = self.session_id
-
-        if not session_id:
-            import sys
-
-            if sys.stdin.isatty() and sys.stdout.isatty():
-                print()
-                print("ControlPlane application setup")
-                print("-" * 70)
-
-                session_id = input("Project/session ID: ").strip()
-
-                if not session_id:
-                    raise ValueError(
-                        "A project/session ID is required."
-                    )
-
-                self.session_id = session_id
-
-            else:
-                raise ValueError(
-                    "session_id is required. Provide session_id when "
-                    "running in a non-interactive environment."
-                )
-
         if self._application_id is None:
             self._application_id = self._controlplane._create_application(
                 name=self.name,
-                session_id=session_id,
             )
 
         run_id = self._controlplane._create_run(
@@ -324,7 +291,6 @@ class Application:
             application_id=self._application_id,
             run_id=run_id,
             application_name=self.name,
-            session_id=session_id,
             input=input,
             context=context,
         )
@@ -339,7 +305,7 @@ class ControlPlane:
 
     Intentional public surface:
 
-        cp.application("My Application", session_id="project")
+        cp.application("My Application")
 
     Low-level ID-based telemetry methods are private so application
     developers cannot choose trace/span identifiers.
@@ -356,12 +322,10 @@ class ControlPlane:
     def application(
         self,
         name: str,
-        session_id: str | None = None,
     ) -> Application:
         return Application(
             controlplane=self,
             name=name,
-            session_id=session_id,
         )
 
     # =========================================================
@@ -404,13 +368,11 @@ class ControlPlane:
         self,
         *,
         name: str,
-        session_id: str,
     ) -> str:
         data = self._post(
             "/applications",
             {
                 "name": name,
-                "session_id": session_id,
             },
         )
 
@@ -658,7 +620,6 @@ class ControlPlane:
         *,
         run_id: str,
         application_name: str,
-        session_id: str,
         input: Any,
         context: Any,
     ):
@@ -675,7 +636,6 @@ class ControlPlane:
                 ),
                 "output": None,
                 "context": _serialize_context(context),
-                "session_id": session_id,
                 "status": "pending",
             },
         )

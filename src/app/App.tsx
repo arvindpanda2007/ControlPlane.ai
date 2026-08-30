@@ -97,7 +97,6 @@ interface ApiApplication {
 id: string;
 application_id: string;
 name: string;
-session_id: string;
 created_at: string;
 run_count: number;
 }
@@ -241,7 +240,6 @@ interface WFEdge { from: string; to: string; }
 type Screen = "home" | "app" | "trace";
 interface AppGroup {
 applicationId: string;
-sessionId: string;
 name: string;
 traces: ApiTrace[];           // Root workflow traces (the actual runs).
 reliability: number;
@@ -670,7 +668,6 @@ else if (reliability < 97 || (quality != null && quality < 90) || safetyFlags > 
 
 return {
   applicationId: application.application_id || application.id,
-  sessionId: application.session_id,
   name: application.name,
   traces: sorted,
   reliability,
@@ -706,7 +703,6 @@ const groups = await Promise.all(
       return traceList.map(trace => ({
         ...trace,
         run_id: trace.run_id || run?.run_id || run?.id,
-        session_id: trace.session_id || application.session_id,
       }));
     });
 
@@ -2467,7 +2463,7 @@ return (
 <div className="w-px h-4 bg-cp-border" />
 <div>
 <div className="text-sm font-semibold text-cp-text">{app.name}</div>
-<div className="text-xs text-cp-muted font-mono">{app.sessionId}</div>
+<div className="text-xs text-cp-muted font-mono">ID {app.applicationId.slice(0, 8)}…</div>
 </div>
 <div className="flex items-center gap-1.5 ml-1">
 <span className="w-2 h-2 rounded-full" style={{ background: hc }} />
@@ -2909,7 +2905,7 @@ useEffect(() => { load(); }, [load]);
 const filtered = apps.filter(a => {
   if (filter !== "all" && a.health !== filter) return false;
   if (search && !a.name.toLowerCase().includes(search.toLowerCase()) &&
-      !a.sessionId.toLowerCase().includes(search.toLowerCase())) return false;
+      !a.applicationId.toLowerCase().includes(search.toLowerCase())) return false;
   return true;
 });
 const counts = {
@@ -3061,7 +3057,7 @@ return (
 <div className="text-sm font-semibold text-cp-text truncate">
 {app.name}
 </div>
-<div className="text-xs text-cp-muted font-mono truncate mt-0.5">{app.sessionId}</div>
+<div className="text-xs text-cp-muted font-mono truncate mt-0.5">ID {app.applicationId.slice(0, 8)}…</div>
 </div>
 <div className="flex items-center gap-1.5 ml-3 flex-shrink-0">
 <span className="w-2 h-2 rounded-full" style={{ background: hc }} />

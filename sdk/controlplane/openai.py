@@ -318,7 +318,6 @@ class OpenAIClient:
             "latency_ms": latency_ms,
             "estimated_cost_usd": estimated_cost_usd,
             "context": context,
-            "session_id": run._session_id,
             "status": status,
             "safety_flag": safety_flag,
             "safety_type": safety_type,
