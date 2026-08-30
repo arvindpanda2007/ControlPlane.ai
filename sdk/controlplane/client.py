@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -146,6 +146,15 @@ class Run:
                 latency_ms=latency_ms,
                 status=status,
             )
+
+            # Shadow evaluation belongs to the completed application run.
+            # Dispatch only after the run status has been persisted.
+            if status == "success":
+                self._controlplane._executor.submit(
+                    self._controlplane._run_shadow_for_run,
+                    self._run_id,
+                    self._trace_id,
+                )
 
         self._closed = True
         return False
@@ -497,11 +506,9 @@ class ControlPlane:
         self._send_llm_trace(payload)
 
         # Shadow must run after the trace exists in the database.
-        if (
-            status == "success"
-            and context
-            and output
-        ):
+        # Do not require context: the evaluator can distinguish
+        # "no grounding context supplied" from an actual factuality failure.
+        if status == "success" and output:
             self._executor.submit(
                 self._run_shadow_evaluation,
                 trace_id,
@@ -548,9 +555,51 @@ class ControlPlane:
             )
 
         except Exception as error:
+            import traceback
+
             print(
-                f"ControlPlane shadow evaluation failed: {error}"
+                f"ControlPlane shadow evaluation failed for "
+                f"{trace_id}: {error}"
             )
+            traceback.print_exc()
+
+    def _run_shadow_for_run(
+        self,
+        run_id: str,
+        root_trace_id: str,
+    ):
+        """
+        Evaluate a completed application run asynchronously.
+        ShadowWorker owns trace discovery, evaluation, and persistence.
+        """
+        try:
+            if self._shadow_worker is None:
+                from .shadow.worker import ShadowWorker
+
+                self._shadow_worker = ShadowWorker()
+
+            if hasattr(self._shadow_worker, "evaluate_run"):
+                self._shadow_worker.evaluate_run(
+                    run_id=run_id,
+                    root_trace_id=root_trace_id,
+                )
+            else:
+                # Temporary compatibility with the existing worker API.
+                self._shadow_worker.evaluate_trace(root_trace_id)
+
+            print(
+                "SHADOW RUN EVALUATION COMPLETE:",
+                run_id,
+            )
+
+        except Exception as error:
+            import traceback
+
+            print(
+                f"ControlPlane shadow run evaluation failed "
+                f"for {run_id}: {error}"
+            )
+            traceback.print_exc()
 
     def _create_trace(
         self,

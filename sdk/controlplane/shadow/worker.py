@@ -1,8 +1,9 @@
 import json
+import uuid
 
 from api.database import get_connection
 
-from controlplane.shadow.evaluator import ShadowEvaluator
+from .evaluator import ShadowEvaluator
 
 
 class ShadowWorker:
@@ -12,6 +13,99 @@ class ShadowWorker:
     ):
         self.evaluator = ShadowEvaluator(
             api_key=api_key
+        )
+
+    # =========================================================
+    # EVALUATE RUN
+    # =========================================================
+
+    def evaluate_run(self, run_id: str, root_trace_id: str):
+        """
+        Evaluate all completed LLM child traces belonging to a completed
+        application run. The root workflow trace itself is not evaluated.
+        """
+        print(
+            f"Shadow: evaluating run {run_id} "
+            f"(root trace {root_trace_id})"
+        )
+
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM traces
+                    WHERE parent_trace_id = %s
+                    ORDER BY started_at ASC NULLS LAST
+                    """,
+                    (root_trace_id,),
+                )
+                rows = cursor.fetchall()
+
+        trace_ids = [str(row[0]) for row in rows]
+
+        if not trace_ids:
+            print(f"Shadow: no child traces found for run {run_id}")
+            return
+
+        # Create the lifecycle rows before evaluation starts.
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                for trace_id in trace_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO shadow_evaluations (
+                            id,
+                            trace_id,
+                            status,
+                            created_at
+                        )
+                        VALUES (%s, %s, 'pending', NOW())
+                        ON CONFLICT (trace_id) DO NOTHING
+                        """,
+                        (str(uuid.uuid4()), trace_id),
+                    )
+
+        for trace_id in trace_ids:
+            try:
+                with get_connection() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE shadow_evaluations
+                            SET status = 'running', error = NULL
+                            WHERE trace_id = %s
+                            """,
+                            (trace_id,),
+                        )
+
+                self.evaluate_trace(trace_id)
+
+            except Exception as error:
+                print(
+                    f"Shadow: run {run_id} failed for trace "
+                    f"{trace_id}: {error}"
+                )
+                try:
+                    with get_connection() as connection:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                """
+                                UPDATE shadow_evaluations
+                                SET status = 'failed', error = %s
+                                WHERE trace_id = %s
+                                """,
+                                (str(error), trace_id),
+                            )
+                except Exception as store_error:
+                    print(
+                        f"Shadow: failed to store failure for "
+                        f"{trace_id}: {store_error}"
+                    )
+
+        print(
+            f"Shadow: finished run {run_id}; "
+            f"processed {len(trace_ids)} child traces"
         )
 
     # =========================================================
@@ -195,6 +289,23 @@ class ShadowWorker:
                 f"{trace_id}: {error}"
             )
 
+            try:
+                with get_connection() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE shadow_evaluations
+                            SET status = 'failed', error = %s
+                            WHERE trace_id = %s
+                            """,
+                            (str(error), trace_id),
+                        )
+            except Exception as store_error:
+                print(
+                    f"Shadow: failed to store evaluation failure "
+                    f"for {trace_id}: {store_error}"
+                )
+
             return
 
         # =====================================================
@@ -297,6 +408,9 @@ class ShadowWorker:
         # 10. STORE COMPLETE EVALUATION
         # =====================================================
 
+        # The Shadow Evaluation has its own lifecycle/table. Do not write
+        # factuality fields onto `traces`: those fields belong to
+        # `shadow_evaluations`.
         try:
 
             with get_connection() as connection:
@@ -305,19 +419,51 @@ class ShadowWorker:
 
                     cursor.execute(
                         """
-                        UPDATE traces
-                        SET
-                            factuality_score = %s,
-                            factuality_status = %s,
-                            shadow_evaluation = %s,
-                            evaluated_at = NOW()
-                        WHERE id = %s
-                        """,
-                        (
+                        INSERT INTO shadow_evaluations (
+                            id,
+                            trace_id,
+                            status,
                             factuality_score,
                             factuality_status,
-                            shadow_evaluation_json,
+                            input,
+                            context,
+                            output,
+                            created_at,
+                            evaluated_at,
+                            error
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            'completed',
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            NOW(),
+                            NOW(),
+                            NULL
+                        )
+                        ON CONFLICT (trace_id)
+                        DO UPDATE SET
+                            status = 'completed',
+                            factuality_score = EXCLUDED.factuality_score,
+                            factuality_status = EXCLUDED.factuality_status,
+                            input = EXCLUDED.input,
+                            context = EXCLUDED.context,
+                            output = EXCLUDED.output,
+                            evaluated_at = EXCLUDED.evaluated_at,
+                            error = NULL
+                        """,
+                        (
+                            str(uuid.uuid4()),
                             trace_id,
+                            factuality_score,
+                            factuality_status,
+                            input_text,
+                            context,
+                            output,
                         ),
                     )
 
