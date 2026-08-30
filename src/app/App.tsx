@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-Search, Settings, Activity, BarChart2, DollarSign, Shield,
+Search, Activity, BarChart2, DollarSign, Shield,
 AlertTriangle, ChevronRight, ChevronLeft, X, Plus, Minus,
 RefreshCw, ArrowRight, Grid3x3, LayoutList, CheckCircle,
 Clock, Cpu, TrendingUp, Loader2, AlertCircle, Command,
@@ -3223,6 +3223,7 @@ const [error, setError] = useState<string | null>(null);
 const [search, setSearch] = useState("");
 const [filter, setFilter] = useState<"all" | "healthy" | "warning" | "critical">("all");
 const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+const [showIntegration, setShowIntegration] = useState(false);
 const load = useCallback(async () => {
   setLoading(true);
   setError(null);
@@ -3264,9 +3265,7 @@ return (
          className="flex items-center gap-1.5 text-xs text-cp-secondary hover\:text-cp-text px-2 py-1.5 rounded border border-cp-border hover\:border-cp-border-strong transition-colors">
 <RefreshCw size={12} /> Refresh
 </button>
-<button className="p-1.5 rounded border border-cp-border text-cp-secondary hover\:text-cp-text transition-colors">
-<Settings size={14} />
-</button>
+
 </div>
 </div>
 
@@ -3278,8 +3277,8 @@ return (
           AI application observability and control plane
         </p>
       </div>
-      <button className="flex items-center gap-1.5 text-xs bg-cp-purple text-white px-3 py-2 rounded hover\:bg-cp-purple/90 transition-colors">
-        <Plus size={12} /> Add Application
+      <button onClick={() => setShowIntegration(true)} className="flex items-center gap-1.5 text-xs bg-cp-purple text-white px-3 py-2 rounded hover\:bg-cp-purple/90 transition-colors">
+        <Plus size={12} /> Integrate SDK
       </button>
     </div>
 
@@ -3375,6 +3374,68 @@ return (
     {!loading && !error && apps.length > 0 && filtered.length === 0 && (
       <div className="text-center py-16 text-xs text-cp-muted">
         No applications match your filters.
+      </div>
+    )}
+
+    {showIntegration && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6" onClick={() => setShowIntegration(false)}>
+        <div className="w-full max-w-3xl max-h-[85vh] overflow-auto rounded-lg border border-cp-border bg-cp-surface shadow-xl" onClick={e => e.stopPropagation()}>
+          <div className="flex items-center justify-between px-5 py-4 border-b border-cp-border">
+            <div>
+              <div className="text-sm font-semibold text-cp-text">Integrate ControlPlane.AI</div>
+              <div className="text-xs text-cp-secondary mt-0.5">Add the SDK to your application and route your OpenAI calls through ControlPlane.</div>
+            </div>
+            <button onClick={() => setShowIntegration(false)} className="p-1.5 rounded text-cp-secondary hover\:text-cp-text" aria-label="Close integration guide"><X size={16} /></button>
+          </div>
+          <div className="p-5 space-y-5">
+            <div>
+              <div className="text-xs font-semibold text-cp-text mb-2">1. Install the SDK</div>
+              <pre className="rounded-md bg-cp-app border border-cp-border p-4 text-xs font-mono text-cp-text overflow-x-auto">pip install controlplaneai-sdk</pre>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-cp-text mb-2">2. Connect your application</div>
+              <pre className="rounded-md bg-cp-app border border-cp-border p-4 text-xs font-mono text-cp-text overflow-x-auto leading-5">{`import os
+from controlplane import ControlPlane
+from controlplane.openai import OpenAIClient
+
+cp = ControlPlane(
+    api_url=os.getenv("CONTROLPLANE_URL", "http://127.0.0.1:8000")
+)
+
+app = cp.application("My AI Application")
+
+llm = OpenAIClient(
+    controlplane=cp,
+    api_key=os.environ["OPENAI_API_KEY"],
+)`}</pre>
+            </div>
+            <div>
+              <div className="text-xs font-semibold text-cp-text mb-2">3. Send OpenAI requests through ControlPlane</div>
+              <pre className="rounded-md bg-cp-app border border-cp-border p-4 text-xs font-mono text-cp-text overflow-x-auto leading-5">{`response = llm.chat(
+    model="gpt-4.1-mini",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_message},
+    ],
+    run=run,
+)`}</pre>
+              <div className="mt-3 rounded-md border border-cp-border bg-cp-elevated p-3">
+                <div className="text-xs font-semibold text-cp-text mb-1">Cost tracking</div>
+                <div className="text-xs text-cp-secondary leading-5">
+                  Cost is currently recorded for <span className="font-mono text-cp-text">gpt-4.1-mini</span>.
+                  Requests using this model will show estimated cost in ControlPlane.
+                </div>
+              </div>
+            </div>
+            <div className="rounded-md border border-cp-border bg-cp-elevated p-4">
+              <div className="text-xs font-semibold text-cp-text mb-1">What ControlPlane captures</div>
+              <div className="text-xs text-cp-secondary leading-5">
+                Traces, latency, token usage, quality evaluations, safety interventions,
+                and estimated cost for <span className="font-mono text-cp-text">gpt-4.1-mini</span>.
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     )}
   </div>
